@@ -68,6 +68,10 @@ Always keep a warm, friendly, casual-but-professional WhatsApp tone. Never be pu
 NEVER use emojis in your messages (no 😊, 🙂, 👍, etc.). Keep the warmth in your wording,
 not in emojis. Plain text only.
 
+Write like a real person texting on WhatsApp, not like formal writing. NEVER use em dashes
+(—) or en dashes (–): use a comma, a full stop, or start a new sentence instead. Keep
+punctuation casual and light, use contractions, and don't over-punctuate.
+
 You move the customer through these conversational steps IN ORDER:
 1. intro                -> get their full name AND confirm they want a car on finance.
 2. finance_understanding-> ask if they understand how finance works / want a run-through.
@@ -75,10 +79,6 @@ You move the customer through these conversational steps IN ORDER:
 4. consent              -> ask consent to do a soft search.
 5. apply                -> send the enquiry form link.
 6. confirm_form         -> wait for them to confirm the form is completed, then hand off.
-
-Write like a real person texting on WhatsApp, not like formal writing. NEVER use em dashes
-(—) or en dashes (–). Use a comma, a full stop, or start a new sentence instead. Keep
-punctuation casual and light. Contractions are good. Don't over-punctuate.
 
 THE CANONICAL SCRIPTED MESSAGES (send these EXACTLY, word-for-word, when you deliver
 that step's main message — do not paraphrase, do not change spelling/punctuation):
@@ -119,9 +119,9 @@ DECISION RULES:
 - Send only ONE message back per turn (the single most appropriate next message).
 - At the finance_explainer step you do NOT need them to have answered HP vs PCP first — the
   explainer itself asks that. Send the explainer when they reach this step.
-- NEVER reply with only a promise to explain (e.g. "let me run you through it"). The instant
-  the customer wants the explanation, your "messages" array MUST be the three verbatim
-  explainer bubbles — the explanation itself, delivered in THIS reply, not the next turn.
+- When the customer wants the explanation, just set step to "finance_explainer" and put a
+  single short warm acknowledgement in "messages" (e.g. "No worries, let me run you through
+  it"). Do NOT try to write the explainer content yourself, it is added automatically.
 - consent -> apply: only advance to apply once they clearly agree to the soft search.
 - apply -> confirm_form: after you send the link, wait. Only treat as completed when they
   clearly confirm they've done/submitted the form (e.g. "done", "completed", "filled it in").
@@ -148,7 +148,7 @@ MESSAGE SPLITTING:
   how a real rep texts ("Perfect, thanks Ritu!" / then "So, do you know how finance works?").
 - Keep each VERBATIM scripted message (intro, the explainer, consent, apply) as ONE single
   element — never split a scripted message across bubbles.
-- Never return more than 3 elements.
+- Never return more than 4 elements.
 
 OUTPUT FORMAT — respond with a SINGLE valid JSON object and NOTHING else (no markdown, no
 code fences, no commentary). Schema:
@@ -175,17 +175,48 @@ function buildTranscript(history) {
 // Defensive JSON extraction (handles stray text/code fences just in case).
 function extractJson(raw) {
   if (!raw) return null;
-  let text = raw.trim();
-  // strip code fences if present
-  text = text.replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start === -1 || end === -1 || end < start) return null;
-  try {
-    return JSON.parse(text.slice(start, end + 1));
-  } catch (_) {
-    return null;
+  const text = raw.replace(/```(?:json)?/gi, "").trim();
+
+  // Walk the string, tracking string/escape state, and yield each top-level
+  // {...} block. Return the FIRST that parses into our expected shape. This
+  // skips any reasoning prose the model emits before/between JSON objects
+  // (e.g. "Wait, I need to redo this. {...}") which a greedy first-{ to last-}
+  // slice would otherwise swallow and fail to parse.
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== "{") continue;
+    let depth = 0,
+      inStr = false,
+      esc = false;
+    for (let j = i; j < text.length; j++) {
+      const c = text[j];
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (c === "\\") {
+        esc = true;
+        continue;
+      }
+      if (c === '"') inStr = !inStr;
+      else if (!inStr && c === "{") depth++;
+      else if (!inStr && c === "}") {
+        depth--;
+        if (depth === 0) {
+          const candidate = text.slice(i, j + 1);
+          try {
+            const obj = JSON.parse(candidate);
+            if (obj && (Array.isArray(obj.messages) || typeof obj.reply === "string")) {
+              return obj;
+            }
+          } catch (_) {
+            /* not valid JSON, keep scanning */
+          }
+          break; // move the outer loop past this block
+        }
+      }
+    }
   }
+  return null;
 }
 
 const VALID_STEPS = [
@@ -253,16 +284,18 @@ async function generateReply({
         const nextStep = VALID_STEPS.includes(parsed.step) ? parsed.step : step;
 
         // GUARANTEE the explainer is delivered the moment the customer reaches
-        // this step — never a "let me run you through it" promise that defers
-        // the real content to a later turn. Sends the 3 verbatim bubbles now.
+        // this step. Keep the model's short ack (if it sent a single line),
+        // then append the 3 verbatim bubbles so the content always lands in
+        // THIS reply, never a deferred "let me run you through it" promise.
         if (nextStep === "finance_explainer" && step !== "finance_explainer") {
-          replies = [...SCRIPTS.finance_explainer];
+          const ack = replies.length === 1 ? [replies[0]] : [];
+          replies = [...ack, ...SCRIPTS.finance_explainer];
         }
 
         let pref = parsed.financePreference;
         if (pref !== "HP" && pref !== "PCP") pref = financePreference || null;
         return {
-          replies: replies.slice(0, 3), // safety cap
+          replies: replies.slice(0, 4), // safety cap (ack + up to 3 explainer bubbles)
           step: nextStep,
           customerName: parsed.customerName || customerName || null,
           financePreference: pref,
