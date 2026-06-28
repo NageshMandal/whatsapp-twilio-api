@@ -68,6 +68,12 @@ function stripEmojis(text) {
     .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, "") // skin-tone modifiers
     .replace(/[\u{FE00}-\u{FE0F}]/gu, "")   // variation selectors
     .replace(/\u200D/gu, "")                 // zero-width joiner
+    // de-robotify punctuation: em/en dashes -> comma, like a human texting
+    .replace(/\s*[—–]\s*/g, ", ")
+    .replace(/\.{3}|…/g, "...")              // smart ellipsis -> plain dots
+    .replace(/[“”]/g, '"')                   // curly double quotes -> straight
+    .replace(/[‘’]/g, "'")                   // curly single quotes -> straight
+    .replace(/,\s*,/g, ",")                  // tidy any accidental double commas
     .replace(/[ \t]{2,}/g, " ")              // tidy double spaces left behind
     .trim();
 }

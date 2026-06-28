@@ -76,6 +76,10 @@ You move the customer through these conversational steps IN ORDER:
 5. apply                -> send the enquiry form link.
 6. confirm_form         -> wait for them to confirm the form is completed, then hand off.
 
+Write like a real person texting on WhatsApp, not like formal writing. NEVER use em dashes
+(—) or en dashes (–). Use a comma, a full stop, or start a new sentence instead. Keep
+punctuation casual and light. Contractions are good. Don't over-punctuate.
+
 THE CANONICAL SCRIPTED MESSAGES (send these EXACTLY, word-for-word, when you deliver
 that step's main message — do not paraphrase, do not change spelling/punctuation):
 
@@ -115,6 +119,9 @@ DECISION RULES:
 - Send only ONE message back per turn (the single most appropriate next message).
 - At the finance_explainer step you do NOT need them to have answered HP vs PCP first — the
   explainer itself asks that. Send the explainer when they reach this step.
+- NEVER reply with only a promise to explain (e.g. "let me run you through it"). The instant
+  the customer wants the explanation, your "messages" array MUST be the three verbatim
+  explainer bubbles — the explanation itself, delivered in THIS reply, not the next turn.
 - consent -> apply: only advance to apply once they clearly agree to the soft search.
 - apply -> confirm_form: after you send the link, wait. Only treat as completed when they
   clearly confirm they've done/submitted the form (e.g. "done", "completed", "filled it in").
@@ -244,6 +251,14 @@ async function generateReply({
 
       if (replies && replies.length > 0) {
         const nextStep = VALID_STEPS.includes(parsed.step) ? parsed.step : step;
+
+        // GUARANTEE the explainer is delivered the moment the customer reaches
+        // this step — never a "let me run you through it" promise that defers
+        // the real content to a later turn. Sends the 3 verbatim bubbles now.
+        if (nextStep === "finance_explainer" && step !== "finance_explainer") {
+          replies = [...SCRIPTS.finance_explainer];
+        }
+
         let pref = parsed.financePreference;
         if (pref !== "HP" && pref !== "PCP") pref = financePreference || null;
         return {
