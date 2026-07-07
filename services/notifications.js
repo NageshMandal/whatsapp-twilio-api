@@ -4,8 +4,21 @@
 
 const { summariseConversation } = require("./aiBrain");
 
-// Override via env if you like; otherwise defaults to the number you provided.
-const ADMIN_NUMBER = process.env.ADMIN_NOTIFY_NUMBER || "+447508671223";
+// Who receives the "New qualified lead" alerts.
+//
+// Set ADMIN_NOTIFY_NUMBER to a single number, or a comma-separated list to fan
+// the lead out to a whole team, e.g.
+//   ADMIN_NOTIFY_NUMBER="+447508671223,+447700900123,+447700900456"
+//
+// NOTE ON GROUPS: Twilio's WhatsApp API can only message individual numbers, it
+// cannot post into a WhatsApp group chat. So to get every qualified lead into a
+// shared "Qualified Leads" space, list each team member's number above (each
+// person gets their own copy of the alert). See the message I sent alongside
+// these files for the full explanation and options.
+const ADMIN_NUMBERS = (process.env.ADMIN_NOTIFY_NUMBER || "+447508671223")
+  .split(",")
+  .map((n) => n.trim())
+  .filter(Boolean);
 
 // "Lead arrival day" = when the conversation document was first created.
 function formatArrival(convo) {
@@ -46,7 +59,17 @@ async function notifyHandoff(convo, { sendWhatsApp }) {
     summary,
   ].join("\n");
 
-  return sendWhatsApp(ADMIN_NUMBER, body);
+  // Send to every configured recipient. One failing number must not stop the
+  // others from getting the lead.
+  const results = [];
+  for (const number of ADMIN_NUMBERS) {
+    try {
+      results.push(await sendWhatsApp(number, body));
+    } catch (err) {
+      console.error(`❌ Qualified-lead alert to ${number} failed:`, err.message);
+    }
+  }
+  return results;
 }
 
-module.exports = { notifyHandoff, ADMIN_NUMBER };
+module.exports = { notifyHandoff, ADMIN_NUMBERS };

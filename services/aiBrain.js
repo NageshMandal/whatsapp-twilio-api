@@ -12,18 +12,22 @@ const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 // ---------------------------------------------------------------------------
 const SCRIPTS = {
   intro:
-    "Hey it’s Charlie and I'm a sales assistant here at from Zenith, I'll help with the initial part of the process and then a member of the team will contact you to help source your car. Can I start by confirming your full name please? And are you looking to get a car on finance?",
+    "Hey it’s Charlie and I'm a sales assistant here at Zenith, I'll help with the initial part of the process and then a member of the team will contact you to help source your car. Can I start by confirming your full name please? And are you looking to get a car on finance?",
 
   finance_understanding:
     "Perfect okay, so do you know how finance works? Or would you like me to run you through it?",
 
-  // Sent as 3 separate WhatsApp bubbles (the single block exceeds WhatsApp's
-  // 1600-char limit). Wording kept verbatim; <br/> tags replaced with real breaks.
+  // Single explainer bubble. (The old 1.0-1.3 trading / mileage / balloon /
+  // documents bubbles were removed at the client's request — they no longer go
+  // out automatically as part of the initial explanation.)
   finance_explainer: [
     "Okay no problem, So there's two types of agreements you can go for:\n\nHp - pay monthly instalments and at the end of the agreement the car is yours\n\nPcp - pay cheaper monthly instalments with the option of part exchanging at the half way point. At the end of the agreement you give the car back, part exchange or pay a “balloon” payment if you want to keep that exact car. It’s up-to you which one you opt for. Some people prefer to own their car at the end of the agreement and keep it for a long while. Some prefer to be able to part exchange it. Which one would you prefer? Bear in mind, the quotes on my page are mostly pcp quotes.",
-    "1.0 trading car\n\nYou can trade the car back early, you’d just need to contact us with the cars reg, current mileage and we’d need to know your balance outstanding on your finance. We will then pay the finance off and buy your car in and then you’ll start a new finance agreement\n\n1.1 mileage limit\n\nThere is a mileage limit and you can adjust it, but it mainly comes into play if you give the car back to the finance company. The contracted mileage limit won’t apply if you sell the car back to us or sell it privately.",
-    "1.2 balloon payment explanation\n\nA balloon payment is an optional final payment you make to own the car. You don’t need to pay it, most customers after 3/4 years generally want an upgrade as newer models are out by then\n\n1.3 Finance documents needed\n\nThe documents you need vary depending on the lender but typically you need proof of income, proof of address and proof of ID",
   ],
+
+  // Sent verbatim whenever the customer asks about part-exchange / trading in
+  // their current car. Delivered automatically by code, never paraphrased.
+  part_ex:
+    "Okay got you. Please send the following details for your current car\nReg:\nMileage:\n2 keys:\nFull service history\nDamages\nAny customisation\nSettlement figure\nCurrent monthly payments\nPlease can you provide accurate information as failure to do so could impact the end valuation",
 
   consent:
     "Okay got you. I just need to confirm your finance eligibility then I’ll take some details about the car you want and send you through some personalised quotes. Is it okay if I can get you to complete a soft search against one of our cars on our website? It’s just a soft search so no impact on your score :)",
@@ -47,9 +51,8 @@ KNOWLEDGE BASE (use to answer customer questions, in your own warm words):
 - HP: pay monthly instalments; at the end the car is theirs.
 - PCP: cheaper monthly instalments; option to part-exchange at the halfway point; at the
   end give the car back, part-exchange, or pay a "balloon" payment to keep that exact car.
-- Trading the car back early: contact us with the car's reg, current mileage and the
-  outstanding finance balance. If it's worth more than the balance they can trade with no
-  cash in; if worth less they can add cash to settle or roll it into the new contract.
+- Part-exchange / trading in their current car: do NOT explain this or answer it from here.
+  Set "partExRequested" to true so the standard details-request message is sent automatically.
 - Mileage limit: adjustable; mainly matters if the car is given back to the finance
   company. It does not apply if they sell back to us or sell privately. Higher mileage can
   reduce a valuation and risk negative equity (e.g. 80k is worth more than 100k).
@@ -75,7 +78,7 @@ punctuation casual and light, use contractions, and don't over-punctuate.
 You move the customer through these conversational steps IN ORDER:
 1. intro                -> get their full name AND confirm they want a car on finance.
 2. finance_understanding-> ask if they understand how finance works / want a run-through.
-3. finance_explainer    -> send the HP/PCP + trading/mileage/balloon/documents explainer.
+3. finance_explainer    -> send the HP/PCP finance explainer.
 4. consent              -> ask consent to do a soft search.
 5. apply                -> send the enquiry form link.
 6. confirm_form         -> wait for them to confirm the form is completed, then hand off.
@@ -89,11 +92,13 @@ ${SCRIPTS.intro}
 [finance_understanding]
 ${SCRIPTS.finance_understanding}
 
-[finance_explainer] — send these as THREE separate messages (3 elements in the "messages"
-array), each verbatim, in this order:
-  (bubble 1) ${SCRIPTS.finance_explainer[0]}
-  (bubble 2) ${SCRIPTS.finance_explainer[1]}
-  (bubble 3) ${SCRIPTS.finance_explainer[2]}
+[finance_explainer] — this single message is sent verbatim (it is added automatically, do
+not write it yourself):
+${SCRIPTS.finance_explainer[0]}
+
+[part_ex] — whenever the customer asks about part-exchange or trading in their current car,
+this EXACT message is sent (it is added automatically, do not write it yourself):
+${SCRIPTS.part_ex}
 
 [consent]
 ${SCRIPTS.consent}
@@ -122,6 +127,11 @@ DECISION RULES:
 - When the customer wants the explanation, just set step to "finance_explainer" and put a
   single short warm acknowledgement in "messages" (e.g. "No worries, let me run you through
   it"). Do NOT try to write the explainer content yourself, it is added automatically.
+- PART EXCHANGE / TRADING IN: if the customer mentions part exchange, part-ex, "trade in",
+  trading in their current car, or wants their current car valued, set "partExRequested" to
+  true and put a brief one-line placeholder in "messages" (e.g. "Okay got you"). The exact
+  details-request message is added automatically, so do NOT write it yourself and do NOT
+  answer from the knowledge base. Do NOT change the step, keep whatever step you were on.
 - consent -> apply: only advance to apply once they clearly agree to the soft search.
 - apply -> confirm_form: after you send the link, wait. Only treat as completed when they
   clearly confirm they've done/submitted the form (e.g. "done", "completed", "filled it in").
@@ -158,6 +168,8 @@ code fences, no commentary). Schema:
            finance_understanding, finance_explainer, consent, apply, confirm_form, handoff>",
   "customerName": "<full name if known, else null>",
   "financePreference": "<\\"HP\\", \\"PCP\\", or null>",
+  "partExRequested": <true ONLY when the customer is asking about part-exchange / trading in
+                      their current car, else false>,
   "handoff": <true only when the form is confirmed completed and you've handed to Zavia, else false>
 }`;
 
@@ -281,6 +293,22 @@ async function generateReply({
       }
 
       if (replies && replies.length > 0) {
+        // Part-exchange / trading-in question overrides everything: send the
+        // EXACT details-request script verbatim and hold the current funnel step
+        // so the conversation isn't derailed.
+        if (parsed.partExRequested === true) {
+          let pref = parsed.financePreference;
+          if (pref !== "HP" && pref !== "PCP") pref = financePreference || null;
+          return {
+            replies: [SCRIPTS.part_ex],
+            step, // unchanged
+            customerName: parsed.customerName || customerName || null,
+            financePreference: pref,
+            handoff: false,
+            error: false,
+          };
+        }
+
         const nextStep = VALID_STEPS.includes(parsed.step) ? parsed.step : step;
 
         // GUARANTEE the explainer is delivered the moment the customer reaches
@@ -295,7 +323,7 @@ async function generateReply({
         let pref = parsed.financePreference;
         if (pref !== "HP" && pref !== "PCP") pref = financePreference || null;
         return {
-          replies: replies.slice(0, 4), // safety cap (ack + up to 3 explainer bubbles)
+          replies: replies.slice(0, 4), // safety cap on bubbles per turn
           step: nextStep,
           customerName: parsed.customerName || customerName || null,
           financePreference: pref,
