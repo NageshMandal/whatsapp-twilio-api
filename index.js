@@ -567,6 +567,21 @@ app.get("/messages/:phoneNumber", async (req, res) => {
   }
 });
 
+// Forward inbound calls (WhatsApp Business Calling OR normal PSTN) to a human.
+// Set CALL_FORWARD_NUMBER in .env (E.164, e.g. +447508671223).
+// TWILIO_VOICE_CALLER_ID should be a Twilio voice number you own (used as the
+// caller ID on the forwarded leg).
+app.post("/voice", (req, res) => {
+  const forwardTo = process.env.CALL_FORWARD_NUMBER;
+  const callerId = process.env.TWILIO_VOICE_CALLER_ID;
+  const callerAttr = callerId ? ` callerId="${callerId}"` : "";
+  const twiml = forwardTo
+    ? `<Response><Say>Please hold while we connect you to the team.</Say>` +
+      `<Dial timeout="25"${callerAttr}>${forwardTo}</Dial></Response>`
+    : `<Response><Say>Sorry, we can't take your call right now. Please message us on WhatsApp and we'll get right back to you.</Say></Response>`;
+  res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>${twiml}`);
+});
+
 // ---------------------------------------------------------------------------
 // Status management — manually advance the funnel & toggle the bot
 // ---------------------------------------------------------------------------
