@@ -1,13 +1,13 @@
 // services/followUps.js
 // Feature 2: automated re-engagement. If a lead goes quiet AFTER we messaged
-// them, nudge them at +30min, then +2h, then +1day. After 3 nudges we stop.
+// them, nudge them ONCE A DAY, starting one day after they went quiet, up to
+// day 5 (5 nudges total). After day 5 we stop.
 // Any inbound message resets the counter (handled in index.js webhook).
 //
 // Timing note: each delay is measured from the LAST outbound message, and
-// lastOutboundAt is bumped every time we send a nudge. So the schedule is
-// "30m after going quiet, then 2h after nudge #1, then 1 day after nudge #2".
-// If you'd rather measure all three from the original quiet point, store a
-// separate `wentQuietAt` and compare against [30m, 2h30m, 1d2h30m] instead.
+// lastOutboundAt is bumped every time we send a nudge. Since every delay is one
+// day, that gives one nudge per day: ~1 day after going quiet, then ~1 day after
+// each nudge, so nudges land on roughly day 1, 2, 3, 4 and 5.
 
 const cron = require("node-cron");
 const Message = require("../models/Message");
@@ -16,9 +16,11 @@ const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
 
-// Delay (since the last outbound message) before each follow-up fires.
-// index 0 -> 1st nudge, index 1 -> 2nd nudge, index 2 -> 3rd nudge.
-const FOLLOW_UP_DELAYS = [30 * MIN, 2 * HOUR, 1 * DAY];
+// Delay (since the last outbound message) before each follow-up fires. Every
+// delay is one day, and lastOutboundAt is bumped after each nudge, so the lead
+// gets one nudge per day: day 1, 2, 3, 4, 5. index 0 -> 1st nudge (day 1) ...
+// index 4 -> 5th nudge (day 5).
+const FOLLOW_UP_DELAYS = [1 * DAY, 1 * DAY, 1 * DAY, 1 * DAY, 1 * DAY];
 const MAX_FOLLOW_UPS = FOLLOW_UP_DELAYS.length;
 
 // Warm, non-pushy nudges in Charlie's tone. Step-aware: a lead sitting on the
@@ -29,13 +31,17 @@ function buildFollowUp(convo, attempt) {
 
   const formNudges = [
     "Hey, just checking in - were you able to get the enquiry form filled in? More than happy to help if you got stuck anywhere.",
-    "No rush at all, just following up on that finance enquiry form. Let me know if you'd like me to resend the link or talk anything through.",
+    "No rush at all, just following up on that finance enquiry form. Want me to resend the link or talk anything through?",
+    "Still happy to help you get this sorted whenever you're ready - just let me know if anything's holding you up with the form.",
+    "Just floating this back to the top for you - it only takes a couple of minutes on the enquiry form and I can get your quotes moving. Give me a shout if you'd like a hand.",
     "Last little nudge from me on this one - whenever you're ready to pick it back up just drop me a message and we'll get you sorted. No pressure at all.",
   ];
 
   const generalNudges = [
     "Hey, just following up on my last message - are you still keen to get something sorted? Happy to help whenever you're ready.",
     "No worries if you've been busy - just checking you're still interested in getting a car on finance? I'm here if you've got any questions.",
+    "Still here whenever you'd like to carry on - just let me know and we'll pick up right where we left off.",
+    "No pressure at all, just checking in again - happy to answer anything or get things moving whenever suits you.",
     "I'll leave it here for now so I'm not bombarding you, but the door is always open - give me a shout whenever you'd like to carry on. No pressure at all.",
   ];
 
@@ -117,7 +123,7 @@ function startFollowUpCron(deps) {
       running = false;
     }
   });
-  console.log("⏰ Follow-up cron started (checks every minute; nudges at 30m / 2h / 1d).");
+  console.log("⏰ Follow-up cron started (checks every minute; one nudge per day, up to day 5).");
 }
 
 module.exports = {

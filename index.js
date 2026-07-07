@@ -3,9 +3,11 @@ const express = require("express");
 const twilio = require("twilio");
 const mongoose = require("mongoose");
 const Message = require("./models/Message");
-const { generateReply, MODEL } = require("./services/aiBrain");
-const { notifyHandoff } = require("./services/notifications");
+const LeadToMessage = require("./models/LeadToMessage");
+const { generateReply, MODEL, SCRIPTS } = require("./services/aiBrain");
+const { notifyHandoff, notifyEscalation } = require("./services/notifications");
 const { startFollowUpCron } = require("./services/followUps");
+const { isAuthorizedSubmitter, parseLeadSubmission } = require("./services/leadIntake");
 const app = express();
 
 mongoose.connect(process.env.MONGODB_URI)
@@ -56,6 +58,158 @@ async function sendWhatsApp(toPhone, body) {
     to: `whatsapp:${toPhone}`,
     body,
   });
+}
+
+// Open a conversation with a brand-new (cold) lead.
+//
+// IMPORTANT: WhatsApp does not allow free-text business-initiated messages to a
+// user who hasn't messaged you in the last 24h. To message a cold lead on a
+// PRODUCTION sender you must use a Meta-approved TEMPLATE. Set its Content SID in
+// TWILIO_INTRO_CONTENT_SID and this sends the template. If that env var is not
+// set, we fall back to sending the plain intro text, which only delivers inside
+// an open 24h window or on the Twilio sandbox (where the lead has joined). Make
+// the template's wording match SCRIPTS.intro so the flow reads the same.
+async function sendLeadIntro(toPhone, name) {
+  const contentSid = process.env.TWILIO_INTRO_CONTENT_SID;
+  if (contentSid) {
+    const params = { from: WHATSAPP_FROM, to: `whatsapp:${toPhone}`, contentSid };
+    // If your approved template has a {{1}} placeholder for the name, opt in:
+    if (name && process.env.TWILIO_INTRO_TEMPLATE_HAS_NAME === "true") {
+      params.contentVariables = JSON.stringify({ 1: name });
+    }
+    return client.messages.create(params);
+  }
+  return sendWhatsApp(toPhone, stripEmojis(SCRIPTS.intro));
+}
+
+// Stage 2: send a queued lead's first message. ONLY on a successful send do we
+// mark it messageSent = true AND create the conversation card in the messages
+// collection (which starts Charlie's flow). Returns { sent, error? }.
+async function sendQueuedLead(lead) {
+  const leadNumber = lead.whatsappNumber;
+  const leadName = lead.name;
+
+  try {
+    await sendLeadIntro(leadNumber, leadName);
+  } catch (err) {
+    console.error("❌ Failed to message queued lead:", leadNumber, err.message);
+    await LeadToMessage.findOneAndUpdate(
+      { whatsappNumber: leadNumber },
+      { $set: { messageSent: false, lastError: err.message } }
+    );
+    return { sent: false, error: err.message };
+  }
+
+  // Mark the queue row as sent.
+  await LeadToMessage.findOneAndUpdate(
+    { whatsappNumber: leadNumber },
+    { $set: { messageSent: true, sentAt: new Date(), lastError: null } }
+  );
+
+  // Create the conversation card in the messages collection.
+  await Message.findOneAndUpdate(
+    { phoneNumber: leadNumber },
+    {
+      $push: {
+        messages: {
+          text: SCRIPTS.intro,
+          direction: "outgoing",
+          isBot: true,
+          stepAtSend: "intro",
+        },
+      },
+      $set: {
+        customerName: leadName || null,
+        step: "intro",
+        status: "Lead",
+        botActive: true,
+        lastOutboundAt: new Date(),
+        followUpCount: 0,
+      },
+      $setOnInsert: { handoffNotified: false },
+    },
+    { upsert: true, returnDocument: "after" }
+  );
+
+  console.log(`👤 First message sent + card created: ${leadName || "(no name)"} ${leadNumber}`);
+  return { sent: true };
+}
+
+// Handle a lead submitted by an authorized admin ("name + number").
+// Stage 1: parse, dedupe, and store the lead in the leadsToMessage queue
+// (messageSent = false). Then (unless AUTO_SEND_QUEUED_LEADS=false) immediately
+// attempt stage 2. Everything is reported back to the admin.
+async function handleLeadSubmission({ adminPhone, text }) {
+  const reply = (msg) => sendWhatsApp(adminPhone, msg);
+
+  const parsed = parseLeadSubmission(text);
+  if (parsed.error) {
+    if (parsed.error === "bad_number") {
+      return reply("That number didn't look right. Please double-check it and resend.");
+    }
+    return reply(
+      "To add a lead, send me their name and number, like this:\n\nJohn Smith\n07700 900123"
+    );
+  }
+
+  const leadNumber = parsed.number;
+  const leadName = parsed.name;
+
+  // Don't let an admin/submitter number be added as a lead.
+  if (isAuthorizedSubmitter(leadNumber)) {
+    return reply("That's an admin number, so I haven't started a lead flow for it.");
+  }
+
+  // Duplicate handling (1): already an active conversation in messages?
+  const existingConvo = await Message.findOne({ phoneNumber: leadNumber });
+  if (existingConvo) {
+    const when = existingConvo.createdAt
+      ? new Date(existingConvo.createdAt).toLocaleDateString("en-GB")
+      : "previously";
+    return reply(
+      `${leadName || "That lead"} (${leadNumber}) is already in the system ` +
+        `(added ${when}, currently: ${existingConvo.status}). Leaving it as it is, ` +
+        `so they won't get a duplicate message.`
+    );
+  }
+
+  // Duplicate handling (2): already sitting in the queue?
+  const existingQueued = await LeadToMessage.findOne({ whatsappNumber: leadNumber });
+  if (existingQueued && existingQueued.messageSent) {
+    return reply(`${leadName || "That lead"} (${leadNumber}) has already been messaged.`);
+  }
+
+  // Stage 1: store (or update) the lead in the leadsToMessage queue.
+  const lead = await LeadToMessage.findOneAndUpdate(
+    { whatsappNumber: leadNumber },
+    {
+      $set: { name: leadName || (existingQueued && existingQueued.name) || null, submittedBy: adminPhone },
+      $setOnInsert: { messageSent: false },
+    },
+    { upsert: true, returnDocument: "after" }
+  );
+
+  // If auto-send is off, stop after queuing.
+  if (process.env.AUTO_SEND_QUEUED_LEADS === "false") {
+    return reply(
+      `Saved ${leadName || "the lead"} (${leadNumber}) to the queue. It'll be messaged when you run the send step.`
+    );
+  }
+
+  // Stage 2: try to send the first message now.
+  const result = await sendQueuedLead(lead);
+  if (result.sent) {
+    return reply(
+      `Done. I've messaged ${leadName || "the lead"} on ${leadNumber} and started the flow. ` +
+        `I'll follow up daily if they go quiet, and ping you when they're qualified.`
+    );
+  }
+
+  return reply(
+    `Saved ${leadName || "the lead"} (${leadNumber}) to the queue, but I couldn't send the ` +
+      `first message yet: ${result.error}. It's marked unsent and I'll retry when you run the ` +
+      `send step (this usually means the WhatsApp template isn't live yet).`
+  );
 }
 
 // Remove emojis from outgoing text (hard guarantee on top of the prompt rule).
@@ -175,9 +329,29 @@ app.post("/webhook/whatsapp", async (req, res) => {
     const phoneNumber = from.replace("whatsapp:", "");
     const incomingText = body || (numMedia > 0 ? "[media message]" : "");
 
+    // 0) Admin lead injection. If the message is from an AUTHORIZED submitter,
+    //    treat it as a "name + number" lead command, not a normal conversation.
+    //    Everyone else falls through to the standard lead flow below.
+    if (isAuthorizedSubmitter(phoneNumber)) {
+      console.log("👤 Admin lead submission from", phoneNumber, "|", incomingText);
+      ackEmpty();
+      try {
+        await handleLeadSubmission({ adminPhone: phoneNumber, text: body });
+      } catch (adminErr) {
+        console.error("❌ Lead submission failed:", adminErr.message);
+        try {
+          await sendWhatsApp(
+            phoneNumber,
+            "Sorry, something went wrong adding that lead. Please try again."
+          );
+        } catch (_) {}
+      }
+      return;
+    }
+
     // 1) Save the incoming message and read current state.
-    //    Reset followUpCount to 0 — the lead just replied, so the nudge
-    //    schedule (30m/2h/1d) starts fresh from our next outbound message.
+    //    Reset followUpCount to 0 — the lead just replied, so the daily nudge
+    //    schedule starts fresh from our next outbound message.
     const convo = await Message.findOneAndUpdate(
       { phoneNumber },
       {
@@ -310,9 +484,63 @@ app.post("/webhook/whatsapp", async (req, res) => {
         console.error("❌ Handoff notification failed:", notifyErr.message);
       }
     }
+
+    // Escalation: the lead asked something important the bot can't handle. Ping the
+    // "handle these leads" destination so a human can jump in. Independent of the
+    // handoff flow — this can fire at any step, and every distinct question notifies.
+    if (!ai.error && allSent && ai.escalate) {
+      try {
+        await notifyEscalation(updatedConvo || convo, {
+          sendWhatsApp,
+          question: incomingText,
+          note: ai.escalationNote,
+        });
+        console.log("🚨 Escalation sent to the team:", ai.escalationNote || incomingText);
+      } catch (escErr) {
+        console.error("❌ Escalation notification failed:", escErr.message);
+      }
+    }
   } catch (error) {
     console.error("❌ Webhook Error:", error);
     ackEmpty(); // never leave Twilio hanging
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Lead queue (leadsToMessage): view the queue and trigger sending of pending leads
+// ---------------------------------------------------------------------------
+app.get("/leads-to-message", async (req, res) => {
+  try {
+    const filter = {};
+    if (req.query.pending === "true") filter.messageSent = false;
+    if (req.query.pending === "false") filter.messageSent = true;
+    const leads = await LeadToMessage.find(filter).sort({ createdAt: -1 });
+    res.json({ success: true, count: leads.length, data: leads });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Send the first message to every lead still pending (messageSent = false).
+// Use this to flush the queue once the WhatsApp template is live, or on a schedule.
+app.post("/leads-to-message/process", async (req, res) => {
+  try {
+    const pending = await LeadToMessage.find({ messageSent: false });
+    const results = { attempted: pending.length, sent: 0, failed: 0, errors: [] };
+
+    for (const lead of pending) {
+      const r = await sendQueuedLead(lead);
+      if (r.sent) {
+        results.sent += 1;
+      } else {
+        results.failed += 1;
+        results.errors.push({ number: lead.whatsappNumber, error: r.error });
+      }
+    }
+
+    res.json({ success: true, ...results });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
