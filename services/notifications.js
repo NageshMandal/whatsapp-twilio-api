@@ -1,24 +1,42 @@
 // services/notifications.js
-// Feature 1: when a lead is qualified and handed off to Zavia, ping the sales
-// team's WhatsApp with the key details + an AI-written summary of the chat.
+// Internal team alerts, split into TWO destinations:
+//   1) notifyHandoff    -> a lead is QUALIFIED and ready for quotes  ("Qualified leads")
+//   2) notifyEscalation -> a lead asked something IMPORTANT the bot can't handle, so a
+//                          human needs to jump in                    ("Handle these leads")
+//
+// ---------------------------------------------------------------------------
+// Note on WhatsApp groups: Twilio's WhatsApp API can only send to an individual
+// phone number, it cannot post into a WhatsApp group chat. So each destination
+// below is one or more phone numbers (comma-separated) and every number listed
+// gets its own copy of the alert.
+//
+//   LEADS_NOTIFY_NUMBER="+447508671223,+447700900123"        (Qualified leads)
+//   ESCALATION_NOTIFY_NUMBER="+447508671223,+447700900456"   (Handle these leads)
+//
+// ESCALATION_NOTIFY_NUMBER falls back to LEADS_NOTIFY_NUMBER if not set, and
+// LEADS_NOTIFY_NUMBER falls back to the legacy ADMIN_NOTIFY_NUMBER.
+// ---------------------------------------------------------------------------
 
 const { summariseConversation } = require("./aiBrain");
 
-// Who receives the "New qualified lead" alerts.
-//
-// Set ADMIN_NOTIFY_NUMBER to a single number, or a comma-separated list to fan
-// the lead out to a whole team, e.g.
-//   ADMIN_NOTIFY_NUMBER="+447508671223,+447700900123,+447700900456"
-//
-// NOTE ON GROUPS: Twilio's WhatsApp API can only message individual numbers, it
-// cannot post into a WhatsApp group chat. So to get every qualified lead into a
-// shared "Qualified Leads" space, list each team member's number above (each
-// person gets their own copy of the alert). See the message I sent alongside
-// these files for the full explanation and options.
-const ADMIN_NUMBERS = (process.env.ADMIN_NOTIFY_NUMBER || "+447508671223")
-  .split(",")
-  .map((n) => n.trim())
-  .filter(Boolean);
+// --- helper: parse a comma-separated number list into a clean array ---
+function numberList(value) {
+  return (value || "")
+    .split(",")
+    .map((n) => n.trim())
+    .filter(Boolean);
+}
+
+// Legacy single-var support: ADMIN_NOTIFY_NUMBER still works as the leads default.
+const LEGACY_DEFAULT = process.env.ADMIN_NOTIFY_NUMBER || "+447508671223";
+
+// Qualified-leads destination.
+const LEAD_NUMBERS = numberList(process.env.LEADS_NOTIFY_NUMBER || LEGACY_DEFAULT);
+
+// Escalation destination (falls back to the leads destination if not set).
+const ESCALATION_NUMBERS = numberList(
+  process.env.ESCALATION_NOTIFY_NUMBER || process.env.LEADS_NOTIFY_NUMBER || LEGACY_DEFAULT
+);
 
 // "Lead arrival day" = when the conversation document was first created.
 function formatArrival(convo) {
@@ -39,7 +57,23 @@ function formatArrival(convo) {
 }
 
 /**
- * Send the qualified-lead notification.
+ * Fan an alert out to every number for a destination. One failing recipient
+ * never stops the others.
+ */
+async function dispatch({ label, body, waNumbers, sendWhatsApp }) {
+  const results = [];
+  for (const number of waNumbers) {
+    try {
+      results.push(await sendWhatsApp(number, body));
+    } catch (err) {
+      console.error(`❌ ${label} alert to ${number} failed:`, err.message);
+    }
+  }
+  return results;
+}
+
+/**
+ * Qualified-lead notification -> "Qualified leads" destination.
  * @param {object} convo  The Mongoose conversation doc (after handoff).
  * @param {{ sendWhatsApp: (phone:string, body:string)=>Promise<any> }} deps
  */
@@ -59,17 +93,46 @@ async function notifyHandoff(convo, { sendWhatsApp }) {
     summary,
   ].join("\n");
 
-  // Send to every configured recipient. One failing number must not stop the
-  // others from getting the lead.
-  const results = [];
-  for (const number of ADMIN_NUMBERS) {
-    try {
-      results.push(await sendWhatsApp(number, body));
-    } catch (err) {
-      console.error(`❌ Qualified-lead alert to ${number} failed:`, err.message);
-    }
-  }
-  return results;
+  return dispatch({
+    label: "Qualified-lead",
+    body,
+    waNumbers: LEAD_NUMBERS,
+    sendWhatsApp,
+  });
 }
 
-module.exports = { notifyHandoff, ADMIN_NUMBERS };
+/**
+ * Escalation notification -> "Handle these leads" destination. Fired when the
+ * bot flags an important question it can't handle, so a human can step in.
+ * @param {object} convo  The Mongoose conversation doc.
+ * @param {{ sendWhatsApp: Function, question?: string, note?: string }} deps
+ */
+async function notifyEscalation(convo, { sendWhatsApp, question, note }) {
+  const body = [
+    "Lead needs a human - important question",
+    "",
+    `Name: ${convo.customerName || "Unknown"}`,
+    `Number: ${convo.phoneNumber}`,
+    `Current stage: ${convo.status || "Lead"}`,
+    note ? `What they need: ${note}` : null,
+    question ? `Their message: ${question}` : null,
+    "",
+    "Please jump in and help this lead.",
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+
+  return dispatch({
+    label: "Escalation",
+    body,
+    waNumbers: ESCALATION_NUMBERS,
+    sendWhatsApp,
+  });
+}
+
+module.exports = {
+  notifyHandoff,
+  notifyEscalation,
+  LEAD_NUMBERS,
+  ESCALATION_NUMBERS,
+};
