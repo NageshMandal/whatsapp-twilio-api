@@ -307,6 +307,29 @@ app.post("/send-whatsapp", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Voice call forwarding: both a normal phone call to a voice-enabled Twilio
+// number AND an inbound WhatsApp Business Calling call hit this endpoint. We
+// forward the caller to a human. Point your number's Voice webhook here.
+//   .env: CALL_FORWARD_NUMBER=+447508671223   (the human to ring)
+//         TWILIO_VOICE_CALLER_ID=+447576598461 (a Twilio number you own)
+// Twilio sends both GET and POST to voice webhooks, so we handle both.
+// ---------------------------------------------------------------------------
+function voiceForwardTwiML() {
+  const forwardTo = process.env.CALL_FORWARD_NUMBER;
+  const callerId = process.env.TWILIO_VOICE_CALLER_ID;
+  const callerAttr = callerId ? ` callerId="${callerId}"` : "";
+  const inner = forwardTo
+    ? `<Say>Please hold while we connect you to the team.</Say>` +
+      `<Dial timeout="25"${callerAttr}>${forwardTo}</Dial>`
+    : `<Say>Sorry, we can't take your call right now. Please message us on WhatsApp and we'll get right back to you.</Say>`;
+  return `<?xml version="1.0" encoding="UTF-8"?><Response>${inner}</Response>`;
+}
+
+app.all("/voice", (req, res) => {
+  res.type("text/xml").send(voiceForwardTwiML());
+});
+
+// ---------------------------------------------------------------------------
 // Webhook: receive -> save -> ask the AI brain (based on DB state) -> reply -> save reply
 // ---------------------------------------------------------------------------
 app.post("/webhook/whatsapp", async (req, res) => {
@@ -565,21 +588,6 @@ app.get("/messages/:phoneNumber", async (req, res) => {
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
-});
-
-// Forward inbound calls (WhatsApp Business Calling OR normal PSTN) to a human.
-// Set CALL_FORWARD_NUMBER in .env (E.164, e.g. +447508671223).
-// TWILIO_VOICE_CALLER_ID should be a Twilio voice number you own (used as the
-// caller ID on the forwarded leg).
-app.post("/voice", (req, res) => {
-  const forwardTo = process.env.CALL_FORWARD_NUMBER;
-  const callerId = process.env.TWILIO_VOICE_CALLER_ID;
-  const callerAttr = callerId ? ` callerId="${callerId}"` : "";
-  const twiml = forwardTo
-    ? `<Response><Say>Please hold while we connect you to the team.</Say>` +
-      `<Dial timeout="25"${callerAttr}>${forwardTo}</Dial></Response>`
-    : `<Response><Say>Sorry, we can't take your call right now. Please message us on WhatsApp and we'll get right back to you.</Say></Response>`;
-  res.type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>${twiml}`);
 });
 
 // ---------------------------------------------------------------------------
