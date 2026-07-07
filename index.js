@@ -71,15 +71,26 @@ async function sendWhatsApp(toPhone, body) {
 // the template's wording match SCRIPTS.intro so the flow reads the same.
 async function sendLeadIntro(toPhone, name) {
   const contentSid = process.env.TWILIO_INTRO_CONTENT_SID;
+  // If PUBLIC_BASE_URL is set, ask Twilio to POST delivery updates (delivered /
+  // failed / undelivered) to /message-status so we can catch cold-send failures
+  // like 63016 instead of trusting the initial "queued" response.
+  const statusCallback = process.env.PUBLIC_BASE_URL
+    ? `${process.env.PUBLIC_BASE_URL.replace(/\/+$/, "")}/message-status`
+    : undefined;
+
+  const params = { from: WHATSAPP_FROM, to: `whatsapp:${toPhone}` };
+  if (statusCallback) params.statusCallback = statusCallback;
+
   if (contentSid) {
-    const params = { from: WHATSAPP_FROM, to: `whatsapp:${toPhone}`, contentSid };
+    params.contentSid = contentSid;
     // If your approved template has a {{1}} placeholder for the name, opt in:
     if (name && process.env.TWILIO_INTRO_TEMPLATE_HAS_NAME === "true") {
       params.contentVariables = JSON.stringify({ 1: name });
     }
-    return client.messages.create(params);
+  } else {
+    params.body = stripEmojis(SCRIPTS.intro);
   }
-  return sendWhatsApp(toPhone, stripEmojis(SCRIPTS.intro));
+  return client.messages.create(params);
 }
 
 // Stage 2: send a queued lead's first message. ONLY on a successful send do we
@@ -327,6 +338,46 @@ function voiceForwardTwiML() {
 
 app.all("/voice", (req, res) => {
   res.type("text/xml").send(voiceForwardTwiML());
+});
+
+// ---------------------------------------------------------------------------
+// Delivery status callback. Twilio POSTs here for each message we sent with a
+// statusCallback (currently the cold lead intro). When a send actually FAILS to
+// deliver (e.g. 63016 "outside messaging window / use a template"), we flip the
+// queued lead back to messageSent=false so it's not lost, record the reason, and
+// remove the conversation card we optimistically created - as long as the lead
+// never actually engaged. Then it can be cleanly retried once a template is live.
+// ---------------------------------------------------------------------------
+app.post("/message-status", async (req, res) => {
+  res.sendStatus(204); // ack Twilio immediately; process below
+
+  try {
+    const status = req.body.MessageStatus || req.body.SmsStatus; // failed | undelivered | delivered | ...
+    const to = (req.body.To || "").replace("whatsapp:", "").trim();
+    const errorCode = req.body.ErrorCode || "";
+    if (!to) return;
+
+    if (status === "failed" || status === "undelivered") {
+      const reason = `Delivery ${status}${errorCode ? ` (error ${errorCode})` : ""}`;
+
+      // 1) Put the lead back in the queue as unsent, with the real reason.
+      await LeadToMessage.findOneAndUpdate(
+        { whatsappNumber: to },
+        { $set: { messageSent: false, sentAt: null, lastError: reason } }
+      );
+
+      // 2) Remove the card we created on the (false) success, but only if the
+      //    lead never replied - so we never wipe a real, active conversation.
+      const card = await Message.findOne({ phoneNumber: to });
+      if (card && !card.lastInboundAt) {
+        await Message.deleteOne({ phoneNumber: to });
+      }
+
+      console.error(`❌ ${to} - ${reason}. Lead flipped back to pending for retry.`);
+    }
+  } catch (err) {
+    console.error("message-status handler error:", err.message);
+  }
 });
 
 // ---------------------------------------------------------------------------
