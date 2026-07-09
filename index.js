@@ -52,12 +52,15 @@ async function sendTyping(messageSid) {
 }
 
 // Send one WhatsApp message via the REST API.
+// Attaches a statusCallback (when PUBLIC_BASE_URL is set) so that ANY message that
+// fails to deliver - including team alerts sent to your own number - shows up in the
+// logs instead of silently vanishing.
 async function sendWhatsApp(toPhone, body) {
-  return client.messages.create({
-    from: WHATSAPP_FROM,
-    to: `whatsapp:${toPhone}`,
-    body,
-  });
+  const params = { from: WHATSAPP_FROM, to: `whatsapp:${toPhone}`, body };
+  if (process.env.PUBLIC_BASE_URL) {
+    params.statusCallback = `${process.env.PUBLIC_BASE_URL.replace(/\/+$/, "")}/message-status`;
+  }
+  return client.messages.create(params);
 }
 
 // Open a conversation with a brand-new (cold) lead.
@@ -359,6 +362,18 @@ app.post("/message-status", async (req, res) => {
 
     if (status === "failed" || status === "undelivered") {
       const reason = `Delivery ${status}${errorCode ? ` (error ${errorCode})` : ""}`;
+
+      // Only treat this as a lead if it's actually in the queue. Otherwise it's
+      // an outbound message to a team member / admin (e.g. a qualified-lead
+      // alert) and must NOT be re-queued or have a card deleted.
+      const queued = await LeadToMessage.findOne({ whatsappNumber: to });
+      if (!queued) {
+        console.error(
+          `❌ Message to ${to} - ${reason}. (Not a queued lead: this is likely a team ` +
+            `alert blocked by WhatsApp's 24h window - that number must message the bot first.)`
+        );
+        return;
+      }
 
       // 1) Put the lead back in the queue as unsent, with the real reason.
       await LeadToMessage.findOneAndUpdate(

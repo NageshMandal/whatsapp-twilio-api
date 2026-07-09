@@ -124,13 +124,25 @@ DECISION RULES:
 - Send only ONE message back per turn (the single most appropriate next message).
 - At the finance_explainer step you do NOT need them to have answered HP vs PCP first — the
   explainer itself asks that. Send the explainer when they reach this step.
-- When the customer wants the explanation, just set step to "finance_explainer" and put a
-  single short warm acknowledgement in "messages" (e.g. "No worries, let me run you through
-  it"). Do NOT try to write the explainer content yourself, it is added automatically.
-- PART EXCHANGE / TRADING IN: if the customer mentions part exchange, part-ex, "trade in",
-  trading in their current car, or wants their current car valued, set "partExRequested" to
-  true and put a brief one-line placeholder in "messages" (e.g. "Okay got you"). The exact
-  details-request message is added automatically, so do NOT write it yourself and do NOT
+- FINANCE UNDERSTANDING — this decides whether the explainer is sent at all:
+  * If they say they ALREADY KNOW how finance works (e.g. "yes I know how it works",
+    "I understand it", "no need"): set "wantsExplainer" to FALSE. Do NOT set the step to
+    finance_explainer. Instead stay on "finance_understanding" and simply ask which they'd
+    prefer, HP or PCP (e.g. "Perfect, so just to confirm then, would you prefer HP or PCP?").
+    Once they answer HP or PCP, advance the step to "consent".
+  * If they want a run-through (e.g. "no", "explain it", "run me through it"): set
+    "wantsExplainer" to TRUE, set step to "finance_explainer", and put a single short warm
+    acknowledgement in "messages" (e.g. "No worries, let me run you through it"). Do NOT try
+    to write the explainer content yourself, it is added automatically.
+- PART EXCHANGE / TRADING IN: set "partExRequested" to true the FIRST time the customer
+  mentions a part exchange, part-ex, "trade in", "trading in", "a car to trade", swapping or
+  selling their current car, or wanting their current car valued — even if they mention it
+  while answering a different question (e.g. "Josiah Peart and yes I have a car to trade"),
+  and even if they are only stating that they HAVE a car to trade rather than asking about
+  it. Do NOT wait for them to ask "what do you need?" — the details request goes out
+  immediately. Put a brief one-line acknowledgement in "messages" (e.g. "Thanks Josiah! And
+  great, we can definitely look at a part exchange for your current car."). The exact
+  details-request message is appended automatically, so do NOT write it yourself and do NOT
   answer from the knowledge base. Do NOT change the step, keep whatever step you were on.
 - consent -> apply: only advance to apply once they clearly agree to the soft search.
 - apply -> confirm_form: after you send the link, wait. Only treat as completed when they
@@ -146,8 +158,13 @@ EDGE CASES:
 - If the message is empty, only an emoji, or only media with no text: gently ask them to
   reply with some text so you can help. Don't advance the step.
 - If they're rude/abusive: stay calm, polite and professional; don't retaliate.
-- If they ask something you genuinely can't answer from the knowledge base: say a colleague
-  will confirm the details, and continue the current step.
+- If they ask something IMPORTANT you genuinely can't answer from the script or knowledge
+  base, or something that needs a human (specific car stock, a specific quote/price they
+  insist on, a complaint, an unusual or complex personal-finance situation, or they ask to
+  speak to a person): set "escalate" to true, put a one-line "escalationNote" describing what
+  they need, warmly reassure them a colleague will help with that, and STAY on the current
+  step. Do NOT escalate for ordinary questions you can already answer (HP vs PCP, mileage,
+  balloon, documents, how the soft search works) — answer those yourself.
 - Never invent prices, specific car stock, or guarantees of acceptance.
 - Keep customerName and financePreference updated whenever you learn them.
 
@@ -170,6 +187,15 @@ code fences, no commentary). Schema:
   "financePreference": "<\\"HP\\", \\"PCP\\", or null>",
   "partExRequested": <true ONLY when the customer is asking about part-exchange / trading in
                       their current car, else false>,
+  "wantsExplainer": <true ONLY when the customer has asked for the finance run-through.
+                     FALSE when they said they already know how finance works.>,
+  "escalate": <true ONLY when the customer has asked an IMPORTANT question you genuinely
+               cannot answer from the script or knowledge base and a human should step in
+               (specific car stock, a specific quote/price they insist on, a complaint, an
+               unusual or complex personal-finance situation, or they ask to speak to a
+               person), else false>,
+  "escalationNote": "<if escalate is true, one short sentence saying what they asked / need,
+                      else null>",
   "handoff": <true only when the form is confirmed completed and you've handed to Zavia, else false>
 }`;
 
@@ -293,18 +319,21 @@ async function generateReply({
       }
 
       if (replies && replies.length > 0) {
-        // Part-exchange / trading-in question overrides everything: send the
-        // EXACT details-request script verbatim and hold the current funnel step
-        // so the conversation isn't derailed.
+        // Part-exchange / trading-in: send the model's short ack, then the EXACT
+        // details-request script, in the SAME turn. The customer never has to ask
+        // "what do you need?" first. Hold the current funnel step.
         if (parsed.partExRequested === true) {
           let pref = parsed.financePreference;
           if (pref !== "HP" && pref !== "PCP") pref = financePreference || null;
+          const ack = replies.length === 1 ? [replies[0]] : [];
           return {
-            replies: [SCRIPTS.part_ex],
+            replies: [...ack, SCRIPTS.part_ex],
             step, // unchanged
             customerName: parsed.customerName || customerName || null,
             financePreference: pref,
             handoff: false,
+            escalate: false,
+            escalationNote: null,
             error: false,
           };
         }
@@ -312,22 +341,32 @@ async function generateReply({
         const nextStep = VALID_STEPS.includes(parsed.step) ? parsed.step : step;
 
         // GUARANTEE the explainer is delivered the moment the customer reaches
-        // this step. Keep the model's short ack (if it sent a single line),
-        // then append the 3 verbatim bubbles so the content always lands in
-        // THIS reply, never a deferred "let me run you through it" promise.
-        if (nextStep === "finance_explainer" && step !== "finance_explainer") {
+        // this step — but ONLY if they actually asked for the run-through. If
+        // they told us they already know how finance works, wantsExplainer is
+        // false and we never dump the explainer on them.
+        if (
+          nextStep === "finance_explainer" &&
+          step !== "finance_explainer" &&
+          parsed.wantsExplainer !== false
+        ) {
           const ack = replies.length === 1 ? [replies[0]] : [];
           replies = [...ack, ...SCRIPTS.finance_explainer];
         }
 
         let pref = parsed.financePreference;
         if (pref !== "HP" && pref !== "PCP") pref = financePreference || null;
+        const escalate = parsed.escalate === true;
         return {
           replies: replies.slice(0, 4), // safety cap on bubbles per turn
           step: nextStep,
           customerName: parsed.customerName || customerName || null,
           financePreference: pref,
           handoff: parsed.handoff === true || nextStep === "handoff",
+          escalate,
+          escalationNote:
+            escalate && typeof parsed.escalationNote === "string"
+              ? parsed.escalationNote.trim()
+              : null,
           error: false,
         };
       }
@@ -346,6 +385,8 @@ async function generateReply({
     customerName,
     financePreference,
     handoff: false,
+    escalate: false,
+    escalationNote: null,
     error: true,
   };
 }
