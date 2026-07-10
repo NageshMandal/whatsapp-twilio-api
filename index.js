@@ -63,6 +63,20 @@ async function sendWhatsApp(toPhone, body) {
   return client.messages.create(params);
 }
 
+// Send an approved WhatsApp TEMPLATE. Unlike free text, this delivers even when
+// the recipient hasn't messaged the bot in the last 24h. `vars` is an object like
+// { 1: "Josiah", 2: "+447..." } matching the template's {{1}}, {{2}} placeholders.
+async function sendWhatsAppTemplate(toPhone, contentSid, vars) {
+  const params = { from: WHATSAPP_FROM, to: `whatsapp:${toPhone}`, contentSid };
+  if (vars && Object.keys(vars).length) {
+    params.contentVariables = JSON.stringify(vars);
+  }
+  if (process.env.PUBLIC_BASE_URL) {
+    params.statusCallback = `${process.env.PUBLIC_BASE_URL.replace(/\/+$/, "")}/message-status`;
+  }
+  return client.messages.create(params);
+}
+
 // Open a conversation with a brand-new (cold) lead.
 //
 // IMPORTANT: WhatsApp does not allow free-text business-initiated messages to a
@@ -563,7 +577,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
     // Feature 1: notify the sales team (once) when the lead is handed off.
     if (isHandoff && updatedConvo && !updatedConvo.handoffNotified) {
       try {
-        await notifyHandoff(updatedConvo, { sendWhatsApp });
+        await notifyHandoff(updatedConvo, { sendWhatsApp, sendWhatsAppTemplate });
         await Message.findOneAndUpdate(
           { phoneNumber },
           { $set: { handoffNotified: true } }
@@ -581,6 +595,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
       try {
         await notifyEscalation(updatedConvo || convo, {
           sendWhatsApp,
+          sendWhatsAppTemplate,
           question: incomingText,
           note: ai.escalationNote,
         });

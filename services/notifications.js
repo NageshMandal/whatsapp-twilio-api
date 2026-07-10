@@ -56,15 +56,49 @@ function formatArrival(convo) {
   });
 }
 
+// WhatsApp template variables must be SINGLE LINE. Meta rejects params that
+// contain newlines, tabs, or 4+ consecutive spaces, and empty values. This
+// flattens any value into a safe, non-empty, single-line string.
+function tplVar(value, fallback = "-") {
+  const s = String(value == null ? "" : value)
+    .replace(/[\r\n\t]+/g, " · ") // newlines -> a visible separator
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return s || fallback;
+}
+
+// Template SIDs for the two alert types. Leave unset to send plain free text
+// (which only delivers if the recipient messaged the bot in the last 24h).
+const LEADS_TEMPLATE_SID = (process.env.LEADS_TEMPLATE_SID || "").trim();
+const ESCALATION_TEMPLATE_SID = (process.env.ESCALATION_TEMPLATE_SID || "").trim();
+
 /**
  * Fan an alert out to every number for a destination. One failing recipient
  * never stops the others.
+ *
+ * If `templateSid` is set AND a sendWhatsAppTemplate function is provided, the
+ * alert goes as an approved template (delivers regardless of the 24h window).
+ * Otherwise it falls back to plain free text.
  */
-async function dispatch({ label, body, waNumbers, sendWhatsApp }) {
+async function dispatch({
+  label,
+  body,
+  waNumbers,
+  sendWhatsApp,
+  sendWhatsAppTemplate,
+  templateSid,
+  templateVars,
+}) {
+  const useTemplate = Boolean(templateSid && sendWhatsAppTemplate);
   const results = [];
+
   for (const number of waNumbers) {
     try {
-      results.push(await sendWhatsApp(number, body));
+      if (useTemplate) {
+        results.push(await sendWhatsAppTemplate(number, templateSid, templateVars));
+      } else {
+        results.push(await sendWhatsApp(number, body));
+      }
     } catch (err) {
       console.error(`❌ ${label} alert to ${number} failed:`, err.message);
     }
@@ -75,9 +109,9 @@ async function dispatch({ label, body, waNumbers, sendWhatsApp }) {
 /**
  * Qualified-lead notification -> "Qualified leads" destination.
  * @param {object} convo  The Mongoose conversation doc (after handoff).
- * @param {{ sendWhatsApp: (phone:string, body:string)=>Promise<any> }} deps
+ * @param {{ sendWhatsApp: Function, sendWhatsAppTemplate?: Function }} deps
  */
-async function notifyHandoff(convo, { sendWhatsApp }) {
+async function notifyHandoff(convo, { sendWhatsApp, sendWhatsAppTemplate }) {
   const summary = await summariseConversation(convo.messages || []);
 
   const body = [
@@ -93,11 +127,29 @@ async function notifyHandoff(convo, { sendWhatsApp }) {
     summary,
   ].join("\n");
 
+  // Matches a 5-variable template, e.g.:
+  //   New qualified lead ready for quotes.
+  //   Name: {{1}}
+  //   Number: {{2}}
+  //   Finance: {{3}}
+  //   Stage: {{4}}
+  //   Summary: {{5}}
+  const templateVars = {
+    1: tplVar(convo.customerName, "Unknown"),
+    2: tplVar(convo.phoneNumber),
+    3: tplVar(convo.financePreference, "Not specified"),
+    4: tplVar(convo.status, "Lead"),
+    5: tplVar(summary, "See chat for details"),
+  };
+
   return dispatch({
     label: "Qualified-lead",
     body,
     waNumbers: LEAD_NUMBERS,
     sendWhatsApp,
+    sendWhatsAppTemplate,
+    templateSid: LEADS_TEMPLATE_SID,
+    templateVars,
   });
 }
 
@@ -105,9 +157,12 @@ async function notifyHandoff(convo, { sendWhatsApp }) {
  * Escalation notification -> "Handle these leads" destination. Fired when the
  * bot flags an important question it can't handle, so a human can step in.
  * @param {object} convo  The Mongoose conversation doc.
- * @param {{ sendWhatsApp: Function, question?: string, note?: string }} deps
+ * @param {{ sendWhatsApp: Function, sendWhatsAppTemplate?: Function, question?: string, note?: string }} deps
  */
-async function notifyEscalation(convo, { sendWhatsApp, question, note }) {
+async function notifyEscalation(
+  convo,
+  { sendWhatsApp, sendWhatsAppTemplate, question, note }
+) {
   const body = [
     "Lead needs a human - important question",
     "",
@@ -122,11 +177,27 @@ async function notifyEscalation(convo, { sendWhatsApp, question, note }) {
     .filter((line) => line !== null)
     .join("\n");
 
+  // Matches a 4-variable template, e.g.:
+  //   Lead needs a human.
+  //   Name: {{1}}
+  //   Number: {{2}}
+  //   What they need: {{3}}
+  //   Their message: {{4}}
+  const templateVars = {
+    1: tplVar(convo.customerName, "Unknown"),
+    2: tplVar(convo.phoneNumber),
+    3: tplVar(note, "Needs assistance"),
+    4: tplVar(question, "See chat"),
+  };
+
   return dispatch({
     label: "Escalation",
     body,
     waNumbers: ESCALATION_NUMBERS,
     sendWhatsApp,
+    sendWhatsAppTemplate,
+    templateSid: ESCALATION_TEMPLATE_SID,
+    templateVars,
   });
 }
 
@@ -135,4 +206,6 @@ module.exports = {
   notifyEscalation,
   LEAD_NUMBERS,
   ESCALATION_NUMBERS,
+  LEADS_TEMPLATE_SID,
+  ESCALATION_TEMPLATE_SID,
 };
