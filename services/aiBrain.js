@@ -135,15 +135,17 @@ DECISION RULES:
     acknowledgement in "messages" (e.g. "No worries, let me run you through it"). Do NOT try
     to write the explainer content yourself, it is added automatically.
 - PART EXCHANGE / TRADING IN: set "partExRequested" to true the FIRST time the customer
-  mentions a part exchange, part-ex, "trade in", "trading in", "a car to trade", swapping or
-  selling their current car, or wanting their current car valued — even if they mention it
-  while answering a different question (e.g. "Josiah Peart and yes I have a car to trade"),
-  and even if they are only stating that they HAVE a car to trade rather than asking about
-  it. Do NOT wait for them to ask "what do you need?" — the details request goes out
-  immediately. Put a brief one-line acknowledgement in "messages" (e.g. "Thanks Josiah! And
-  great, we can definitely look at a part exchange for your current car."). The exact
-  details-request message is appended automatically, so do NOT write it yourself and do NOT
-  answer from the knowledge base. Do NOT change the step, keep whatever step you were on.
+  mentions a part exchange, part-ex, "trade in", "trading in", "a car to trade", "I want to
+  trade a car", swapping or selling their current car, or wanting their current car valued.
+  This applies EVEN AT THE VERY START before you know their name (e.g. their first message is
+  "I want to trade a car") and EVEN IF they mention it while answering another question. Do
+  NOT wait for a name, do NOT wait for them to ask "what do you need?" — acknowledge warmly
+  and the details request goes out immediately. The exact details-request message is appended
+  automatically, so do NOT write it yourself and do NOT answer from the knowledge base.
+  IMPORTANT: if "PART-EXCHANGE DETAILS ALREADY REQUESTED" is "yes", the form has ALREADY been
+  sent — set partExRequested to FALSE and do NOT ask for those details again. Just acknowledge
+  their message normally (e.g. "No problem, send those over whenever you're ready") and carry
+  on with the funnel. You still capture their name and continue collecting it if unknown.
 - consent -> apply: only advance to apply once they clearly agree to the soft search.
 - apply -> confirm_form: after you send the link, wait. Only treat as completed when they
   clearly confirm they've done/submitted the form (e.g. "done", "completed", "filled it in").
@@ -276,12 +278,14 @@ async function generateReply({
   step = "intro",
   customerName = null,
   financePreference = null,
+  partExSent = false,
   history = [],
 }) {
   const userContent = [
     `CURRENT STEP: ${step}`,
     `KNOWN CUSTOMER NAME: ${customerName || "unknown"}`,
     `KNOWN FINANCE PREFERENCE: ${financePreference || "unknown"}`,
+    `PART-EXCHANGE DETAILS ALREADY REQUESTED: ${partExSent ? "yes" : "no"}`,
     "",
     "CONVERSATION SO FAR (oldest first; the last line is the message you must respond to):",
     buildTranscript(history),
@@ -320,9 +324,10 @@ async function generateReply({
 
       if (replies && replies.length > 0) {
         // Part-exchange / trading-in: send the model's short ack, then the EXACT
-        // details-request script, in the SAME turn. The customer never has to ask
-        // "what do you need?" first. Hold the current funnel step.
-        if (parsed.partExRequested === true) {
+        // details-request script, in the SAME turn. But send that form ONLY ONCE
+        // per conversation - if we've already sent it, never send it again (this
+        // stops the loop where every "ok I'll send them" re-triggered the form).
+        if (parsed.partExRequested === true && !partExSent) {
           let pref = parsed.financePreference;
           if (pref !== "HP" && pref !== "PCP") pref = financePreference || null;
           const ack = replies.length === 1 ? [replies[0]] : [];
@@ -331,6 +336,7 @@ async function generateReply({
             step, // unchanged
             customerName: parsed.customerName || customerName || null,
             financePreference: pref,
+            partExSent: true, // remember we've sent it
             handoff: false,
             escalate: false,
             escalationNote: null,
@@ -367,6 +373,7 @@ async function generateReply({
             escalate && typeof parsed.escalationNote === "string"
               ? parsed.escalationNote.trim()
               : null,
+          partExSent, // preserve the flag once set
           error: false,
         };
       }
@@ -384,6 +391,7 @@ async function generateReply({
     step,
     customerName,
     financePreference,
+    partExSent,
     handoff: false,
     escalate: false,
     escalationNote: null,

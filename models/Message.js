@@ -90,6 +90,7 @@ const messageSchema = new mongoose.Schema(
     followUpCount: { type: Number, default: 0 },
     // ensures the sales-team handoff notification is sent exactly once.
     handoffNotified: { type: Boolean, default: false },
+    partExSent: { type: Boolean, default: false },
 
     lastInboundAt: { type: Date, default: null },
     lastOutboundAt: { type: Date, default: null },

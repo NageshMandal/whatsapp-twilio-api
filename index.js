@@ -504,6 +504,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
       step: convo.step,
       customerName: convo.customerName,
       financePreference: convo.financePreference,
+      partExSent: convo.partExSent === true,
       history: convo.messages,
     });
 
@@ -559,6 +560,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
       update.$set.step = ai.step;
       if (ai.customerName) update.$set.customerName = ai.customerName;
       if (ai.financePreference) update.$set.financePreference = ai.financePreference;
+      if (ai.partExSent) update.$set.partExSent = true;
 
       if (ai.handoff || ai.step === "handoff") {
         update.$set.botActive = false;
