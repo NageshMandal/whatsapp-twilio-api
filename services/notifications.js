@@ -71,6 +71,12 @@ function tplVar(value, fallback = "-") {
 // (which only delivers if the recipient messaged the bot in the last 24h).
 const LEADS_TEMPLATE_SID = (process.env.LEADS_TEMPLATE_SID || "").trim();
 const ESCALATION_TEMPLATE_SID = (process.env.ESCALATION_TEMPLATE_SID || "").trim();
+// Falls back to the qualified-leads template if you haven't made a separate one.
+const PARTEX_TEMPLATE_SID = (
+  process.env.PARTEX_TEMPLATE_SID ||
+  process.env.LEADS_TEMPLATE_SID ||
+  ""
+).trim();
 
 /**
  * Fan an alert out to every number for a destination. One failing recipient
@@ -154,6 +160,54 @@ async function notifyHandoff(convo, { sendWhatsApp, sendWhatsAppTemplate }) {
 }
 
 /**
+ * Part-exchange details notification -> "Qualified leads" destination.
+ * Fired the moment a customer sends their part-ex details, WITHOUT waiting for
+ * them to complete the enquiry form. A lead who has handed over their reg,
+ * mileage and settlement figure is worth chasing even if they never finish the
+ * form, so this makes sure the team sees them.
+ * @param {object} convo  The Mongoose conversation doc.
+ * @param {{ sendWhatsApp: Function, sendWhatsAppTemplate?: Function, details?: string }} deps
+ */
+async function notifyPartEx(convo, { sendWhatsApp, sendWhatsAppTemplate, details }) {
+  const body = [
+    "Part exchange details received",
+    "",
+    `Name: ${convo.customerName || "Unknown"}`,
+    `Number: ${convo.phoneNumber}`,
+    `Finance preference: ${convo.financePreference || "Not specified"}`,
+    `Lead arrived: ${formatArrival(convo)}`,
+    "",
+    "Their car:",
+    details || "(see chat)",
+    "",
+    "Note: they have NOT completed the enquiry form yet.",
+  ].join("\n");
+
+  // Matches a 4-variable template, e.g.:
+  //   Part exchange details received.
+  //   Name: {{1}}
+  //   Number: {{2}}
+  //   Finance: {{3}}
+  //   Their car: {{4}}
+  const templateVars = {
+    1: tplVar(convo.customerName, "Unknown"),
+    2: tplVar(convo.phoneNumber),
+    3: tplVar(convo.financePreference, "Not specified"),
+    4: tplVar(details, "See chat"),
+  };
+
+  return dispatch({
+    label: "Part-exchange",
+    body,
+    waNumbers: LEAD_NUMBERS,
+    sendWhatsApp,
+    sendWhatsAppTemplate,
+    templateSid: PARTEX_TEMPLATE_SID,
+    templateVars,
+  });
+}
+
+/**
  * Escalation notification -> "Handle these leads" destination. Fired when the
  * bot flags an important question it can't handle, so a human can step in.
  * @param {object} convo  The Mongoose conversation doc.
@@ -203,9 +257,11 @@ async function notifyEscalation(
 
 module.exports = {
   notifyHandoff,
+  notifyPartEx,
   notifyEscalation,
   LEAD_NUMBERS,
   ESCALATION_NUMBERS,
   LEADS_TEMPLATE_SID,
   ESCALATION_TEMPLATE_SID,
+  PARTEX_TEMPLATE_SID,
 };

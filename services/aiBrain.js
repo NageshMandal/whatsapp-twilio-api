@@ -27,10 +27,10 @@ const SCRIPTS = {
   // Sent verbatim whenever the customer asks about part-exchange / trading in
   // their current car. Delivered automatically by code, never paraphrased.
   part_ex:
-    "Okay got you. Please send the following details for your current car\nReg:\nMileage:\n2 keys:\nFull service history\nDamages\nAny customisation\nSettlement figure\nCurrent monthly payments\nPlease can you provide accurate information as failure to do so could impact the end valuation",
+    "Please send the following details for your current car\nReg:\nMileage:\n2 keys:\nFull service history\nDamages\nAny customisation\nSettlement figure\nCurrent monthly payments\nPlease can you provide accurate information as failure to do so could impact the end valuation",
 
   consent:
-    "Okay got you. I just need to confirm your finance eligibility then I’ll take some details about the car you want and send you through some personalised quotes. Is it okay if I can get you to complete a soft search against one of our cars on our website? It’s just a soft search so no impact on your score :)",
+    "I just need to confirm your finance eligibility then I’ll take some details about the car you want and send you through some personalised quotes. Is it okay if I can get you to complete a soft search against one of our cars on our website? It’s just a soft search so no impact on your score :)",
 
   apply:
     "Great! If you can complete the general enquiry form on this link please. I'll use these details for the soft search on our system. Please let me know once done. It's just a soft search so no impact on your score :) https://www.zenithmotorcompany.co.uk/finance.php",
@@ -126,6 +126,17 @@ DECISION RULES:
   you already asked the current step's question a moment ago, do not ask it again. If the
   customer's latest message answers it, acknowledge and move on; if they haven't answered yet,
   wait or nudge gently ONCE rather than re-sending the same question.
+- ACKNOWLEDGEMENTS — keep them SHORT and VARIED, and only ONE per turn:
+  * Never open two messages in a row with the same phrase. Before writing an ack, look at the
+    openers you've already used in this conversation and pick different wording. "Okay got you"
+    especially must NOT become a verbal tic, if you've used it once, do not use it again.
+  * An ack is a few words, not a sentence restating what they said. "Nice one", "Perfect",
+    "No problem", "Sure thing" are plenty. Do NOT write "Of course, no problem at all! We can
+    look at a part exchange for you." when the details request is about to follow anyway.
+  * Do NOT acknowledge something twice. If a scripted message is going out after your ack, your
+    ack must not say the same thing the script is about to say.
+  * If you have nothing genuinely new to add, skip the ack entirely and just send the step's
+    message. A missing ack reads better than a redundant one.
 - At the finance_explainer step you do NOT need them to have answered HP vs PCP first — the
   explainer itself asks that. Send the explainer when they reach this step.
 - FINANCE UNDERSTANDING — this decides whether the explainer is sent at all:
@@ -150,6 +161,17 @@ DECISION RULES:
   sent — set partExRequested to FALSE and do NOT ask for those details again. Just acknowledge
   their message normally (e.g. "No problem, send those over whenever you're ready") and carry
   on with the funnel. You still capture their name and continue collecting it if unknown.
+- PART-EXCHANGE DETAILS ARRIVING: set "partExDetailsProvided" to true on the turn where the
+  customer actually SENDS their car details (a reg, a mileage, a settlement figure, monthly
+  payments, service history answers, etc. — often several lines at once, sometimes just bare
+  values like "456763 / 12km / Yes / No"). Set it to true ONLY on that turn, not on every
+  later message. If they only PROMISE to send them ("I'll send them later"), leave it false.
+  These details are forwarded to the sales team automatically, so do NOT ask them to repeat
+  them and do NOT try to value the car yourself.
+- AFTER part-ex details arrive: thank them briefly, tell them a colleague will value it, then
+  go STRAIGHT back to where the funnel was and ask that step's question again. Do not let the
+  part-exchange conversation stall the funnel: the goal is still to get consent for the soft
+  search and then get the enquiry form link in front of them.
 - consent -> apply: only advance to apply once they clearly agree to the soft search.
 - apply -> confirm_form: after you send the link, wait. Only treat as completed when they
   clearly confirm they've done/submitted the form (e.g. "done", "completed", "filled it in").
@@ -193,6 +215,9 @@ code fences, no commentary). Schema:
   "financePreference": "<\\"HP\\", \\"PCP\\", or null>",
   "partExRequested": <true ONLY when the customer is asking about part-exchange / trading in
                       their current car, else false>,
+  "partExDetailsProvided": <true ONLY on the turn where the customer actually sends their
+                            current car's details (reg / mileage / settlement figure etc.),
+                            else false>,
   "wantsExplainer": <true ONLY when the customer has asked for the finance run-through.
                      FALSE when they said they already know how finance works.>,
   "escalate": <true ONLY when the customer has asked an IMPORTANT question you genuinely
@@ -341,6 +366,7 @@ async function generateReply({
             customerName: parsed.customerName || customerName || null,
             financePreference: pref,
             partExSent: true, // remember we've sent it
+            partExDetailsProvided: false, // they're asking, not sending details yet
             handoff: false,
             escalate: false,
             escalationNote: null,
@@ -371,6 +397,8 @@ async function generateReply({
           step: nextStep,
           customerName: parsed.customerName || customerName || null,
           financePreference: pref,
+          // true only on the turn the customer actually sends their car details
+          partExDetailsProvided: parsed.partExDetailsProvided === true,
           handoff: parsed.handoff === true || nextStep === "handoff",
           escalate,
           escalationNote:
@@ -396,6 +424,7 @@ async function generateReply({
     customerName,
     financePreference,
     partExSent,
+    partExDetailsProvided: false,
     handoff: false,
     escalate: false,
     escalationNote: null,

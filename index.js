@@ -5,7 +5,7 @@ const mongoose = require("mongoose");
 const Message = require("./models/Message");
 const LeadToMessage = require("./models/LeadToMessage");
 const { generateReply, MODEL, SCRIPTS } = require("./services/aiBrain");
-const { notifyHandoff, notifyEscalation } = require("./services/notifications");
+const { notifyHandoff, notifyPartEx, notifyEscalation } = require("./services/notifications");
 const { startFollowUpCron } = require("./services/followUps");
 const { isAuthorizedSubmitter, parseLeadSubmission } = require("./services/leadIntake");
 const app = express();
@@ -624,6 +624,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
       if (ai.customerName) update.$set.customerName = ai.customerName;
       if (ai.financePreference) update.$set.financePreference = ai.financePreference;
       if (ai.partExSent) update.$set.partExSent = true;
+      // Capture the part-ex details the customer just sent so the team alert
+      // (below) and the CRM both have them.
+      if (ai.partExDetailsProvided) update.$set.partExDetails = incomingText;
 
       if (ai.handoff || ai.step === "handoff") {
         update.$set.botActive = false;
@@ -650,6 +653,33 @@ app.post("/webhook/whatsapp", async (req, res) => {
         console.log("📤 Handoff notification sent to the sales team.");
       } catch (notifyErr) {
         console.error("❌ Handoff notification failed:", notifyErr.message);
+      }
+    }
+
+    // Part-exchange details: forward them to the sales team the moment they land,
+    // WITHOUT waiting for the enquiry form to be completed. A lead who's handed
+    // over their reg / mileage / settlement figure is worth chasing even if they
+    // never finish the form. Sent once per conversation (partExNotified).
+    if (
+      !ai.error &&
+      allSent &&
+      ai.partExDetailsProvided &&
+      updatedConvo &&
+      !updatedConvo.partExNotified
+    ) {
+      try {
+        await notifyPartEx(updatedConvo, {
+          sendWhatsApp,
+          sendWhatsAppTemplate,
+          details: incomingText,
+        });
+        await Message.findOneAndUpdate(
+          { phoneNumber },
+          { $set: { partExNotified: true } }
+        );
+        console.log("🚗 Part-exchange details forwarded to the team.");
+      } catch (pxErr) {
+        console.error("❌ Part-exchange notification failed:", pxErr.message);
       }
     }
 

@@ -91,6 +91,10 @@ const messageSchema = new mongoose.Schema(
     // ensures the sales-team handoff notification is sent exactly once.
     handoffNotified: { type: Boolean, default: false },
     partExSent: { type: Boolean, default: false },
+    // the raw part-exchange details the customer sent (reg, mileage, etc.), and
+    // a flag so the team alert for them goes out exactly once.
+    partExDetails: { type: String, default: null },
+    partExNotified: { type: Boolean, default: false },
 
     lastInboundAt: { type: Date, default: null },
     lastOutboundAt: { type: Date, default: null },
