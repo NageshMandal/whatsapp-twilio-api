@@ -62,6 +62,60 @@ KNOWLEDGE BASE (use to answer customer questions, in your own warm words):
 - Soft search: no impact on credit score.
 `;
 
+// ---------------------------------------------------------------------------
+// Ack de-duplication.
+// Before an auto-injected script we let the model write a short ack bubble. It
+// has a stubborn habit of PREVIEWING the script in that ack — e.g. writing
+// "Just need to confirm your finance eligibility first so I can get you some
+// personalised quotes." immediately before the consent script, which opens with
+// almost exactly the same sentence. The customer then reads the same thing twice
+// and it looks like the bot double-replied.
+//
+// Prompt rules alone don't hold this, so we enforce it in code: split the ack
+// into sentences and drop any sentence that echoes the script (shares a run of
+// 4+ consecutive words with it). If nothing survives, the ack bubble is dropped
+// entirely and the script goes out on its own — a missing ack reads far better
+// than a duplicated one.
+function normaliseWords(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function ngrams(words, n) {
+  const out = new Set();
+  for (let i = 0; i + n <= words.length; i++) out.add(words.slice(i, i + n).join(" "));
+  return out;
+}
+
+function dedupeAck(ack, script, n = 4) {
+  if (!ack) return null;
+  const scriptText = Array.isArray(script) ? script.join(" ") : script;
+  const scriptGrams = ngrams(normaliseWords(scriptText), n);
+  if (!scriptGrams.size) return ack;
+
+  const sentences = String(ack).match(/[^.!?]+[.!?]*/g) || [String(ack)];
+  const kept = sentences.filter((sentence) => {
+    for (const g of ngrams(normaliseWords(sentence), n)) {
+      if (scriptGrams.has(g)) return false; // this sentence echoes the script
+    }
+    return true;
+  });
+
+  const result = kept.join(" ").replace(/\s{2,}/g, " ").trim();
+  return result || null;
+}
+
+// Build the bubbles for a turn where a script is injected: a de-duplicated ack
+// (if anything is left of it) followed by the verbatim script.
+function withScript(replies, script) {
+  const ackText = replies.length === 1 ? dedupeAck(replies[0], script) : null;
+  const scriptBubbles = Array.isArray(script) ? script : [script];
+  return ackText ? [ackText, ...scriptBubbles] : [...scriptBubbles];
+}
+
 const SYSTEM_PROMPT = `You are "Charlie", a friendly sales assistant for Zenith Motor Company,
 talking to a customer over WhatsApp. You handle the FIRST part of the process (lead
 qualification) and then hand the customer to a colleague named Zavia.
@@ -372,9 +426,8 @@ async function generateReply({
         if (parsed.partExRequested === true && !partExSent) {
           let pref = parsed.financePreference;
           if (pref !== "HP" && pref !== "PCP") pref = financePreference || null;
-          const ack = replies.length === 1 ? [replies[0]] : [];
           return {
-            replies: [...ack, SCRIPTS.part_ex],
+            replies: withScript(replies, SCRIPTS.part_ex),
             step, // unchanged
             customerName: parsed.customerName || customerName || null,
             financePreference: pref,
@@ -398,8 +451,7 @@ async function generateReply({
           step !== "finance_explainer" &&
           parsed.wantsExplainer !== false
         ) {
-          const ack = replies.length === 1 ? [replies[0]] : [];
-          replies = [...ack, ...SCRIPTS.finance_explainer];
+          replies = withScript(replies, SCRIPTS.finance_explainer);
         }
 
         // GUARANTEE the consent + apply scripts are delivered VERBATIM the moment
@@ -411,13 +463,11 @@ async function generateReply({
         // "yes" twice before the form link appeared. Injecting them here makes the
         // wording exact and keeps the funnel to one turn per step.
         if (nextStep === "consent" && step !== "consent") {
-          const ack = replies.length === 1 ? [replies[0]] : [];
-          replies = [...ack, SCRIPTS.consent];
+          replies = withScript(replies, SCRIPTS.consent);
         }
 
         if (nextStep === "apply" && step !== "apply") {
-          const ack = replies.length === 1 ? [replies[0]] : [];
-          replies = [...ack, SCRIPTS.apply];
+          replies = withScript(replies, SCRIPTS.apply);
         }
 
         let pref = parsed.financePreference;
