@@ -108,24 +108,40 @@ function dedupeAck(ack, script, n = 4) {
   return result || null;
 }
 
-// Build the bubbles for a turn where a script is injected. The de-duplicated ack
-// (if anything survives) is merged into the FRONT of the script, separated by a
-// blank line, so the customer receives ONE WhatsApp message instead of two:
+// Trim an ack down to its opening interjection only.
+// The model likes to tack a restatement onto the ack — "Perfect, PCP it is.",
+// "Nice one, HP it is." — which just parrots what the customer already said and
+// pads out the message. We keep everything up to the first comma or sentence end
+// and drop the rest, so "Perfect, PCP it is." becomes "Perfect." A trailing comma
+// is normalised into a full stop.
+function shortenAck(ack) {
+  if (!ack) return null;
+  const trimmed = String(ack).trim();
+  const m = trimmed.match(/^[^,.!?]+([.!?]|,)/);
+  if (!m) return trimmed; // no punctuation to cut on, leave it alone
+  return m[0].replace(/,$/, ".").trim();
+}
+
+// Build the bubbles for a turn where a script is injected. The ack is first
+// stripped of anything that echoes the script (dedupeAck), then trimmed to its
+// opening interjection (shortenAck), then merged into the FRONT of the script
+// separated by a blank line, so the customer receives ONE WhatsApp message:
 //
-//   Great, PCP it is.
+//   Perfect.
 //
 //   I just need to confirm your finance eligibility then I'll take some details...
 //
 // The script text itself is still delivered verbatim — the ack only ever sits in
-// front of it, nothing inside the script is altered. If the ack is dropped by
-// dedupeAck, the script goes out on its own exactly as written.
+// front of it, nothing inside the script is altered. If the ack is dropped, the
+// script goes out on its own exactly as written.
 function withScript(replies, script) {
-  const ackText = replies.length === 1 ? dedupeAck(replies[0], script) : null;
+  const deduped = replies.length === 1 ? dedupeAck(replies[0], script) : null;
+  const ackText = shortenAck(deduped);
   const scriptBubbles = Array.isArray(script) ? script : [script];
   if (!ackText) return [...scriptBubbles];
 
   const [first, ...rest] = scriptBubbles;
-  return [`${ackText.trim()}\n\n${first}`, ...rest];
+  return [`${ackText}\n\n${first}`, ...rest];
 }
 
 const SYSTEM_PROMPT = `You are "Charlie", a friendly sales assistant for Zenith Motor Company,
@@ -206,6 +222,11 @@ DECISION RULES:
   customer's latest message answers it, acknowledge and move on; if they haven't answered yet,
   wait or nudge gently ONCE rather than re-sending the same question.
 - ACKNOWLEDGEMENTS — keep them SHORT and VARIED, and only ONE per turn:
+  * When you advance to an auto-injected step ([finance_explainer], [part_ex], [consent],
+    [apply]), your ack must be ONE short interjection and nothing else: "Perfect.", "Nice
+    one.", "Great.", "No worries.", "Of course." Do NOT parrot back what they just said
+    ("Perfect, PCP it is." -> just "Perfect."). Do NOT add a second sentence. The script
+    that follows does all the talking.
   * Never open two messages in a row with the same phrase. Before writing an ack, look at the
     openers you've already used in this conversation and pick different wording. "Okay got you"
     especially must NOT become a verbal tic, if you've used it once, do not use it again.
