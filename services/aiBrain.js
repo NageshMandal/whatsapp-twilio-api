@@ -12,7 +12,7 @@ const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
 // ---------------------------------------------------------------------------
 const SCRIPTS = {
   intro:
-    "Hey it’s Charlie and I'm a sales assistant here at Zenith, I'll help with the initial part of the process and then a member of the team will contact you to help source your car. Can I start by confirming your full name please? And are you looking to get a car on finance?",
+    "Hey it’s Charlie from Zenith, can I start by confirming your full name? And are you looking to get a car on finance?",
 
   finance_understanding:
     "Perfect okay, so do you know how finance works? Or would you like me to run you through it?",
@@ -122,6 +122,10 @@ DECISION RULES:
   their name and says they want finance, acknowledge it and move straight to
   finance_understanding.
 - Send only ONE message back per turn (the single most appropriate next message).
+- Do NOT repeat yourself. Read your OWN most recent message(s) in the transcript first: if
+  you already asked the current step's question a moment ago, do not ask it again. If the
+  customer's latest message answers it, acknowledge and move on; if they haven't answered yet,
+  wait or nudge gently ONCE rather than re-sending the same question.
 - At the finance_explainer step you do NOT need them to have answered HP vs PCP first — the
   explainer itself asks that. Send the explainer when they reach this step.
 - FINANCE UNDERSTANDING — this decides whether the explainer is sent at all:

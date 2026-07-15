@@ -27,6 +27,43 @@ const WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886
 const axios = require("axios");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---------------------------------------------------------------------------
+// Inbound debounce / coalescing.
+// WhatsApp users often fire several messages in a row ("HP" then "I want to own
+// the car"). Twilio delivers each as a SEPARATE webhook call, and with no
+// coalescing each call independently reads the SAME conversation state and
+// generates its own reply — which is why Charlie was asking the same question
+// (full name, HP vs PCP, soft-search consent) twice.
+//
+// Fix: each inbound stamps the conversation with an incrementing token, then
+// waits a short window. If a NEWER inbound lands during the wait, this (older)
+// call bows out and lets the newest one respond. Only the last message of a
+// burst proceeds — and it re-reads the full history — so the customer gets ONE
+// reply that takes all of their messages into account.
+//
+// NOTE: this token map is in-process, i.e. it assumes a single app instance (as
+// currently deployed). If you ever scale to multiple instances, move the token
+// into the DB / a shared store (e.g. Redis) so the coalescing still holds.
+const INBOUND_DEBOUNCE_MS = parseInt(process.env.INBOUND_DEBOUNCE_MS || "7000", 10);
+const latestInbound = new Map(); // phoneNumber -> latest inbound token
+let inboundSeq = 0;
+
+// Stamp this inbound as the most recent for the number and return its token.
+function stampInbound(phoneNumber) {
+  const token = ++inboundSeq;
+  latestInbound.set(phoneNumber, token);
+  return token;
+}
+
+// Wait out the burst window. Returns true if THIS call is still the newest
+// inbound afterwards (so it should generate the reply), false if it was
+// superseded by a later message.
+async function waitForBurstToSettle(phoneNumber, token) {
+  if (INBOUND_DEBOUNCE_MS <= 0) return latestInbound.get(phoneNumber) === token;
+  await sleep(INBOUND_DEBOUNCE_MS);
+  return latestInbound.get(phoneNumber) === token;
+}
+
 // Best-effort WhatsApp typing indicator. Sending it ALSO marks the referenced
 // inbound message as read (blue ticks) for the user. Public Beta — may not work
 // on the sandbox, so failures are swallowed and never break the flow.
@@ -452,10 +489,14 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return;
     }
 
+    // Stamp this inbound as the newest for the number BEFORE anything async, so
+    // burst ordering reflects true arrival order (see waitForBurstToSettle).
+    const inboundToken = stampInbound(phoneNumber);
+
     // 1) Save the incoming message and read current state.
     //    Reset followUpCount to 0 — the lead just replied, so the daily nudge
     //    schedule starts fresh from our next outbound message.
-    const convo = await Message.findOneAndUpdate(
+    let convo = await Message.findOneAndUpdate(
       { phoneNumber },
       {
         $push: { messages: { text: incomingText, direction: "incoming", isBot: false } },
@@ -498,6 +539,28 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return;
     }
     if (!body) return; // genuinely empty inbound
+
+    // 4b) Coalesce message bursts. Wait a short window; if the customer sent
+    //     another message while we waited, THIS call bows out and the newer one
+    //     replies. This is what stops Charlie asking the same question twice when
+    //     someone fires off "HP" then "I want to own the car" back-to-back.
+    const stillLatest = await waitForBurstToSettle(phoneNumber, inboundToken);
+    if (!stillLatest) {
+      console.log("⏳ Superseded by a newer message from", phoneNumber, "— skipping this reply.");
+      return;
+    }
+
+    // Re-read state now that the burst has settled, so the reply is based on the
+    // FULL set of messages (and any name / step / bot-takeover updates that
+    // landed during the window), not just the first message of the burst.
+    const refreshed = await Message.findOne({ phoneNumber });
+    if (refreshed) convo = refreshed;
+
+    // A human may have taken over while we were waiting — respect that.
+    if (convo.botActive === false) {
+      console.log("🤖 Bot went inactive during the burst window — leaving for a human.");
+      return;
+    }
 
     // 5) Ask the AI brain for the next reply(s)
     const ai = await generateReply({
