@@ -108,12 +108,24 @@ function dedupeAck(ack, script, n = 4) {
   return result || null;
 }
 
-// Build the bubbles for a turn where a script is injected: a de-duplicated ack
-// (if anything is left of it) followed by the verbatim script.
+// Build the bubbles for a turn where a script is injected. The de-duplicated ack
+// (if anything survives) is merged into the FRONT of the script, separated by a
+// blank line, so the customer receives ONE WhatsApp message instead of two:
+//
+//   Great, PCP it is.
+//
+//   I just need to confirm your finance eligibility then I'll take some details...
+//
+// The script text itself is still delivered verbatim — the ack only ever sits in
+// front of it, nothing inside the script is altered. If the ack is dropped by
+// dedupeAck, the script goes out on its own exactly as written.
 function withScript(replies, script) {
   const ackText = replies.length === 1 ? dedupeAck(replies[0], script) : null;
   const scriptBubbles = Array.isArray(script) ? script : [script];
-  return ackText ? [ackText, ...scriptBubbles] : [...scriptBubbles];
+  if (!ackText) return [...scriptBubbles];
+
+  const [first, ...rest] = scriptBubbles;
+  return [`${ackText.trim()}\n\n${first}`, ...rest];
 }
 
 const SYSTEM_PROMPT = `You are "Charlie", a friendly sales assistant for Zenith Motor Company,
