@@ -100,10 +100,13 @@ ${SCRIPTS.finance_explainer[0]}
 this EXACT message is sent (it is added automatically, do not write it yourself):
 ${SCRIPTS.part_ex}
 
-[consent]
+[consent] — this EXACT message is sent automatically when the customer reaches this step. Do
+NOT write it yourself, do NOT paraphrase it, and do NOT ask for soft-search consent in your
+own words ahead of it. Your reply for this turn is at most a SHORT ack:
 ${SCRIPTS.consent}
 
-[apply]
+[apply] — this EXACT message is sent automatically when the customer reaches this step. Do NOT
+write it yourself, do NOT paraphrase it, and never type the link yourself:
 ${SCRIPTS.apply}
 
 [confirm_form] — your reply MUST contain this exact phrase, then a short friendly wrap-up:
@@ -121,6 +124,16 @@ DECISION RULES:
 - Skip questions you already know the answer to. E.g. if their first message already gives
   their name and says they want finance, acknowledge it and move straight to
   finance_understanding.
+- NEVER pre-empt an auto-injected script. The [finance_explainer], [part_ex], [consent] and
+  [apply] messages are appended by the system the moment the customer reaches that step. Do
+  NOT write your own version of them, and do NOT ask that step's question early in different
+  words. If you paraphrase the question and the script then follows, the customer gets asked
+  the SAME thing twice and has to answer twice. When you advance to one of those steps, your
+  own text must be a SHORT ack only (or nothing at all) — the script asks the question.
+- If the customer's message ALREADY answers the current step's question, treat that step as
+  done and advance immediately. Do not ask them to confirm something they just told you. E.g.
+  "Yes car on finance" already confirms they want finance, so do NOT then ask "and are you
+  looking at finance, yes?". "Yes sure" to a consent ask IS consent, so advance to apply.
 - Send only ONE message back per turn (the single most appropriate next message).
 - Do NOT repeat yourself. Read your OWN most recent message(s) in the transcript first: if
   you already asked the current step's question a moment ago, do not ask it again. If the
@@ -387,6 +400,24 @@ async function generateReply({
         ) {
           const ack = replies.length === 1 ? [replies[0]] : [];
           replies = [...ack, ...SCRIPTS.finance_explainer];
+        }
+
+        // GUARANTEE the consent + apply scripts are delivered VERBATIM the moment
+        // the customer arrives at those steps, exactly like the explainer above.
+        // Previously these were left to the model to retype from the prompt, and
+        // it paraphrased them ("So just to confirm your eligibility, is it okay if
+        // I get you to complete a soft search...") — then the REAL script went out
+        // a turn later, so the customer was asked for consent TWICE and had to say
+        // "yes" twice before the form link appeared. Injecting them here makes the
+        // wording exact and keeps the funnel to one turn per step.
+        if (nextStep === "consent" && step !== "consent") {
+          const ack = replies.length === 1 ? [replies[0]] : [];
+          replies = [...ack, SCRIPTS.consent];
+        }
+
+        if (nextStep === "apply" && step !== "apply") {
+          const ack = replies.length === 1 ? [replies[0]] : [];
+          replies = [...ack, SCRIPTS.apply];
         }
 
         let pref = parsed.financePreference;
