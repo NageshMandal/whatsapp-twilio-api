@@ -515,10 +515,19 @@ async function handleCarBrief({ phoneNumber, fromNumber, text }) {
   });
 
   if (!started.ok) {
+    // Push failed — but the request is still sitting on the queue as "queued",
+    // so a polling desk can pick it up regardless. Leaving it there turns a
+    // misconfigured CAR_SOURCE_URL into a delay instead of a lost brief, which
+    // matters because the most likely cause is CAR_SOURCE_URL pointing at a
+    // localhost that belongs to THIS server rather than the desk.
+    console.log(`⚠️  Push to the desk failed (${started.error}) — leaving "${carLabel}" queued for collection.`);
     await SourcingRequest.findByIdAndUpdate(request._id, {
-      $set: { status: "failed", error: started.error, completedAt: new Date() },
+      $set: { status: "queued", error: `push failed: ${started.error}` },
     });
-    await reply(`I couldn't start that search — ${started.error}`);
+    await reply(
+      `That's queued — I couldn't hand it straight to the desk, so it'll run ` +
+      `as soon as one picks it up. I'll message you either way.`
+    );
     return;
   }
 
