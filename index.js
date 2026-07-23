@@ -8,6 +8,9 @@ const { generateReply, MODEL, SCRIPTS } = require("./services/aiBrain");
 const { notifyHandoff, notifyPartEx, notifyEscalation } = require("./services/notifications");
 const { startFollowUpCron } = require("./services/followUps");
 const { isAuthorizedSubmitter, parseLeadSubmission } = require("./services/leadIntake");
+const SourcingRequest = require("./models/SourcingRequest");
+const { looksLikeCarBrief, parseBrief, summariseBrief, startScrape } = require("./services/carSourcing");
+const senders = require("./services/senders");
 const app = express();
 
 mongoose.connect(process.env.MONGODB_URI)
@@ -92,8 +95,13 @@ async function sendTyping(messageSid) {
 // Attaches a statusCallback (when PUBLIC_BASE_URL is set) so that ANY message that
 // fails to deliver - including team alerts sent to your own number - shows up in the
 // logs instead of silently vanishing.
-async function sendWhatsApp(toPhone, body) {
-  const params = { from: WHATSAPP_FROM, to: `whatsapp:${toPhone}`, body };
+// `from` is the sender to reply THROUGH. It defaults to the configured sender
+// for messages we start, but every reply to an inbound message passes the
+// number that message arrived on — replying from a different sender would open
+// a second thread on the customer's phone and fall outside the 24-hour window
+// that belongs to the number they wrote to.
+async function sendWhatsApp(toPhone, body, from) {
+  const params = { from: from || WHATSAPP_FROM, to: `whatsapp:${toPhone}`, body };
   if (process.env.PUBLIC_BASE_URL) {
     params.statusCallback = `${process.env.PUBLIC_BASE_URL.replace(/\/+$/, "")}/message-status`;
   }
@@ -103,8 +111,8 @@ async function sendWhatsApp(toPhone, body) {
 // Send an approved WhatsApp TEMPLATE. Unlike free text, this delivers even when
 // the recipient hasn't messaged the bot in the last 24h. `vars` is an object like
 // { 1: "Josiah", 2: "+447..." } matching the template's {{1}}, {{2}} placeholders.
-async function sendWhatsAppTemplate(toPhone, contentSid, vars) {
-  const params = { from: WHATSAPP_FROM, to: `whatsapp:${toPhone}`, contentSid };
+async function sendWhatsAppTemplate(toPhone, contentSid, vars, from) {
+  const params = { from: from || WHATSAPP_FROM, to: `whatsapp:${toPhone}`, contentSid };
   if (vars && Object.keys(vars).length) {
     params.contentVariables = JSON.stringify(vars);
   }
@@ -449,6 +457,82 @@ app.post("/message-status", async (req, res) => {
 // ---------------------------------------------------------------------------
 // Webhook: receive -> save -> ask the AI brain (based on DB state) -> reply -> save reply
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Car sourcing over WhatsApp.
+//
+// An authorised submitter sends a brief; we parse it with Claude, echo back
+// what we understood, hand the search to the deal desk, and reply again when
+// the scrape finishes. The desk does the scraping — this service only
+// translates and notifies.
+// ---------------------------------------------------------------------------
+async function handleCarBrief({ phoneNumber, fromNumber, text }) {
+  const reply = (msg) => sendWhatsApp(phoneNumber, msg, fromNumber);
+
+  const parsed = await parseBrief(text);
+  if (!parsed.ok) {
+    await reply(
+      `I couldn't turn that into a search — ${parsed.error}\n\n` +
+      `Send it like this:\nMake - Audi\nModel - Q2\nAge - 2022 onwards\nMileage - under 60k`
+    );
+    return;
+  }
+
+  const brief = parsed.brief;
+  const carLabel = [brief.make, brief.model].filter(Boolean).join(" ");
+
+  const request = await SourcingRequest.create({
+    phoneNumber, fromNumber, rawText: text, brief, carLabel, status: "queued",
+  });
+
+  // Echo the understanding BEFORE the scrape. A misread brief costs three
+  // minutes and a wrong shortlist; a one-line confirmation costs nothing and
+  // lets the sender correct it immediately.
+  await reply(`Searching: ${summariseBrief(brief)}\nI'll message you when it's done.`);
+
+  // This project already uses PUBLIC_BASE_URL for Twilio status callbacks;
+  // reuse it rather than making the operator set a second URL that means the
+  // same thing. PUBLIC_URL stays supported as an alias.
+  // Two ways the desk can get this brief:
+  //
+  //   PUSH — CAR_SOURCE_URL is set, meaning the desk is reachable from here
+  //          (same machine, or hosted). We POST it straight over.
+  //   PULL — CAR_SOURCE_URL is unset. The brief simply sits on the queue and
+  //          the desk collects it. This is the mode to use when this service
+  //          is deployed and the desk runs on a workstation.
+  //
+  // Either way the desk POSTs the result back to /webhook/sourcing-complete,
+  // which is outbound from the desk and works in both topologies.
+  if (!process.env.CAR_SOURCE_URL) {
+    console.log(`🚗 Queued "${carLabel}" for ${phoneNumber} — waiting for a desk to collect it`);
+    return;
+  }
+
+  const base = (process.env.PUBLIC_BASE_URL || process.env.PUBLIC_URL || "").replace(/\/+$/, "");
+  const started = await startScrape(brief, {
+    requestId: String(request._id),
+    callbackUrl: base ? `${base}/webhook/sourcing-complete` : "",
+    callbackToken: process.env.CAR_SOURCE_CALLBACK_TOKEN || "",
+  });
+
+  if (!started.ok) {
+    await SourcingRequest.findByIdAndUpdate(request._id, {
+      $set: { status: "failed", error: started.error, completedAt: new Date() },
+    });
+    await reply(`I couldn't start that search — ${started.error}`);
+    return;
+  }
+
+  await SourcingRequest.findByIdAndUpdate(request._id, {
+    $set: {
+      status: "scraping",
+      chatId: started.chatId || null,
+      jobId: started.jobId || null,
+      dashboardUrl: started.dashboardUrl || null,
+    },
+  });
+  console.log(`🚗 Sourcing "${carLabel}" for ${phoneNumber} — chat ${started.chatId}`);
+}
+
 app.post("/webhook/whatsapp", async (req, res) => {
   // Acknowledge Twilio immediately with an empty TwiML response. We send all
   // replies ourselves via the REST API so we can show typing + pace bubbles.
@@ -460,6 +544,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
   try {
     const from = req.body.From;
+    // Which of OUR senders received this. Replies go back out through it.
+    const inboundTo = req.body.To;
+    const replyFrom = senders.replyFrom(inboundTo);
     const body = (req.body.Body || "").trim();
     const numMedia = parseInt(req.body.NumMedia || "0", 10);
     const inboundSid = req.body.MessageSid; // needed for typing / read receipt
@@ -473,8 +560,26 @@ app.post("/webhook/whatsapp", async (req, res) => {
     //    treat it as a "name + number" lead command, not a normal conversation.
     //    Everyone else falls through to the standard lead flow below.
     if (isAuthorizedSubmitter(phoneNumber)) {
-      console.log("👤 Admin lead submission from", phoneNumber, "|", incomingText);
       ackEmpty();
+
+      // An admin sends two different kinds of message. A car brief has
+      // "Make - ..." style lines; a lead submission has a phone number. The
+      // check is a cheap pattern match rather than an LLM call, because
+      // "Make -" already answers the question.
+      if (looksLikeCarBrief(body)) {
+        console.log("🚗 Car brief from", phoneNumber, "on", senders.senderLabel(inboundTo));
+        try {
+          await handleCarBrief({ phoneNumber, fromNumber: replyFrom, text: body });
+        } catch (briefErr) {
+          console.error("❌ Car brief failed:", briefErr.message);
+          try {
+            await sendWhatsApp(phoneNumber, `That search didn't start — ${briefErr.message}`, replyFrom);
+          } catch (_) {}
+        }
+        return;
+      }
+
+      console.log("👤 Admin lead submission from", phoneNumber, "|", incomingText);
       try {
         await handleLeadSubmission({ adminPhone: phoneNumber, text: body });
       } catch (adminErr) {
@@ -482,7 +587,8 @@ app.post("/webhook/whatsapp", async (req, res) => {
         try {
           await sendWhatsApp(
             phoneNumber,
-            "Sorry, something went wrong adding that lead. Please try again."
+            "Sorry, something went wrong adding that lead. Please try again.",
+            replyFrom
           );
         } catch (_) {}
       }
@@ -708,6 +814,160 @@ app.post("/webhook/whatsapp", async (req, res) => {
 // ---------------------------------------------------------------------------
 // Lead queue (leadsToMessage): view the queue and trigger sending of pending leads
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Queue API — for a deal desk that CANNOT be reached from here.
+//
+// The desk runs Puppeteer on a workstation behind NAT, so nothing on the open
+// internet can POST to it. Rather than tunnel a browser-driving service into
+// the public internet, the desk PULLS: it polls for queued briefs, claims one,
+// scrapes, then POSTs the result back here. Both hops are outbound from the
+// desk, so it needs no inbound port and no tunnel at all.
+//
+// Same shared secret as the push direction, so there is one key to manage.
+// ---------------------------------------------------------------------------
+function requireSourcingKey(req, res, next) {
+  const key = process.env.CAR_SOURCE_API_KEY || "";
+  if (!key) return res.status(503).json({ ok: false, error: "CAR_SOURCE_API_KEY is not set." });
+  const given = req.get("x-api-key") || "";
+  if (given.length !== key.length || given !== key) {
+    return res.status(401).json({ ok: false, error: "Bad API key." });
+  }
+  next();
+}
+
+// How long a claimed request may sit before another desk may take it.
+const CLAIM_TTL_MS = parseInt(process.env.SOURCING_CLAIM_TTL_MS || "900000", 10); // 15 min
+
+app.get("/api/sourcing/pending", requireSourcingKey, async (req, res) => {
+  const staleBefore = new Date(Date.now() - CLAIM_TTL_MS);
+  const rows = await SourcingRequest.find({
+    $or: [
+      { status: "queued" },
+      // A desk that crashed mid-scrape leaves this behind; hand it to the next.
+      { status: "scraping", claimedAt: { $lt: staleBefore } },
+    ],
+  })
+    .sort({ createdAt: 1 })
+    .limit(parseInt(req.query.limit, 10) || 5);
+
+  res.json({
+    ok: true,
+    count: rows.length,
+    requests: rows.map((r) => ({
+      id: String(r._id),
+      brief: r.brief,
+      carLabel: r.carLabel,
+      phoneNumber: r.phoneNumber,
+      attempts: r.attempts,
+      createdAt: r.createdAt,
+    })),
+  });
+});
+
+// Claim one request. Atomic, so two desks polling at once cannot both take it.
+app.post("/api/sourcing/:id/claim", requireSourcingKey, async (req, res) => {
+  const staleBefore = new Date(Date.now() - CLAIM_TTL_MS);
+  const claimed = await SourcingRequest.findOneAndUpdate(
+    {
+      _id: req.params.id,
+      replySent: false,
+      $or: [{ status: "queued" }, { status: "scraping", claimedAt: { $lt: staleBefore } }],
+    },
+    {
+      $set: { status: "scraping", claimedAt: new Date(), claimedBy: req.body?.worker || "desk" },
+      $inc: { attempts: 1 },
+    },
+    { returnDocument: "after" }
+  ).catch(() => null);
+
+  if (!claimed) return res.status(409).json({ ok: false, error: "Already claimed or finished." });
+  res.json({
+    ok: true,
+    request: {
+      id: String(claimed._id),
+      brief: claimed.brief,
+      carLabel: claimed.carLabel,
+      attempts: claimed.attempts,
+    },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The deal desk calls this when a scrape finishes.
+//
+// Answers 200 as fast as it can and sends the WhatsApp afterwards: the desk
+// retries a non-2xx, and a slow Twilio call is not a reason for it to try
+// again. `replySent` makes the reply exactly-once even if it does.
+// ---------------------------------------------------------------------------
+app.post("/webhook/sourcing-complete", async (req, res) => {
+  const token = process.env.CAR_SOURCE_CALLBACK_TOKEN || "";
+  if (token && req.get("x-callback-token") !== token) {
+    return res.status(401).json({ ok: false, error: "bad callback token" });
+  }
+
+  const { ref, ok, car, matched, bySource, error, dashboardUrl, runId } = req.body || {};
+  if (!ref) return res.status(400).json({ ok: false, error: "ref is required" });
+
+  let request = null;
+  try {
+    request = await SourcingRequest.findById(ref);
+  } catch (_) { /* not an ObjectId */ }
+  if (!request) return res.status(404).json({ ok: false, error: "unknown ref" });
+
+  // Claim the reply atomically. Two overlapping retries would otherwise both
+  // pass the check and both send.
+  const claimed = await SourcingRequest.findOneAndUpdate(
+    { _id: request._id, replySent: false },
+    {
+      $set: {
+        status: ok ? "done" : "failed",
+        matched: matched ?? null,
+        bySource: bySource || null,
+        error: error || null,
+        runId: runId || null,
+        dashboardUrl: dashboardUrl || request.dashboardUrl,
+        completedAt: new Date(),
+        replySent: true,
+        replySentAt: new Date(),
+      },
+    },
+    { returnDocument: "after" }
+  );
+  res.json({ ok: true, duplicate: !claimed });
+  if (!claimed) {
+    console.log("↩️  Duplicate sourcing callback for", ref, "— already replied.");
+    return;
+  }
+
+  const label = car || claimed.carLabel || "your search";
+  const link = claimed.dashboardUrl ? `\n${claimed.dashboardUrl}` : "";
+  const text = ok
+    ? `Scraping done for the ${label} — please check dashboard.` +
+      (matched != null ? `\n${matched} car${matched === 1 ? "" : "s"} found.` : "") +
+      link
+    : `The ${label} search didn't finish — ${error || "unknown error"}.`;
+
+  try {
+    await sendWhatsApp(claimed.phoneNumber, text, claimed.fromNumber || undefined);
+    console.log(`✅ Told ${claimed.phoneNumber} that ${label} is ready.`);
+  } catch (err) {
+    // The record already says replied; log loudly rather than risk a loop.
+    console.error("❌ Could not send the sourcing reply:", err.message);
+    await SourcingRequest.findByIdAndUpdate(claimed._id, { $set: { error: "reply failed: " + err.message } });
+  }
+});
+
+// What has been asked for, and where each request got to.
+app.get("/sourcing-requests", async (req, res) => {
+  const rows = await SourcingRequest.find({}, { rawText: 0 }).sort({ createdAt: -1 }).limit(100);
+  res.json({ ok: true, count: rows.length, requests: rows });
+});
+
+// Which senders this service is configured to answer on.
+app.get("/senders", (_req, res) => {
+  res.json({ ok: true, senders: senders.listSenders(), default: senders.defaultFrom(), sourcing: senders.sourcingFrom() });
+});
+
 app.get("/leads-to-message", async (req, res) => {
   try {
     const filter = {};
