@@ -343,7 +343,10 @@ app.get("/health", (req, res) => {
 // ---------------------------------------------------------------------------
 app.post("/send-whatsapp", async (req, res) => {
   try {
-    const { to, message } = req.body;
+    // `from` is optional: omit it for the default sender, or pass a number to
+    // send through a specific one. Useful for testing a newly added sender
+    // without changing TWILIO_WHATSAPP_FROM and restarting.
+    const { to, message, from } = req.body;
 
     if (!to || !message) {
       return res.status(400).json({
@@ -354,7 +357,7 @@ app.post("/send-whatsapp", async (req, res) => {
 
     const result = await client.messages.create({
       body: message,
-      from: WHATSAPP_FROM,
+      from: from ? senders.toTwilio(from) : WHATSAPP_FROM,
       to: `whatsapp:${to}`
     });
 
@@ -468,6 +471,17 @@ app.post("/message-status", async (req, res) => {
 async function handleCarBrief({ phoneNumber, fromNumber, text }) {
   const reply = (msg) => sendWhatsApp(phoneNumber, msg, fromNumber);
 
+  // Acknowledge FIRST, before the model call and the database write.
+  //
+  // The confirmation used to be the first thing the sender heard, and it comes
+  // after a model round trip. When that round trip was slow, or the service
+  // was restarting, the sender got nothing at all and had no way to tell
+  // whether the brief had even arrived — so they sent it again, and again.
+  // One cheap line up front separates "did you hear me" from "did it work".
+  await reply("Got that — reading the brief now.").catch((e) =>
+    console.error("❌ Could not send the brief ack:", e.message)
+  );
+
   const parsed = await parseBrief(text);
   if (!parsed.ok) {
     await reply(
@@ -578,7 +592,16 @@ app.post("/webhook/whatsapp", async (req, res) => {
       if (looksLikeCarBrief(body)) {
         console.log("🚗 Car brief from", phoneNumber, "on", senders.senderLabel(inboundTo));
         try {
-          await handleCarBrief({ phoneNumber, fromNumber: replyFrom, text: body });
+          // Hard ceiling on the whole handler. Even with the model call bounded,
+          // a wedged Mongo write or a stalled HTTP request must not leave the
+          // sender in silence — the one outcome with no recovery path, because
+          // they cannot tell a slow search from a dead service.
+          await Promise.race([
+            handleCarBrief({ phoneNumber, fromNumber: replyFrom, text: body }),
+            new Promise((_, rej) =>
+              setTimeout(() => rej(new Error("timed out starting the search")), 90000)
+            ),
+          ]);
         } catch (briefErr) {
           console.error("❌ Car brief failed:", briefErr.message);
           try {
@@ -1077,6 +1100,16 @@ app.patch("/messages/:phoneNumber/status", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+// An unhandled rejection kills the process under some Node configurations and
+// silently swallows the request under others. Either way the sender hears
+// nothing, so both get logged loudly rather than left to pm2 to notice.
+process.on("unhandledRejection", (err) => {
+  console.error("💥 Unhandled rejection:", err && err.stack ? err.stack : err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("💥 Uncaught exception:", err && err.stack ? err.stack : err);
+});
 
 app.listen(PORT, () => {
   console.log("=================================");

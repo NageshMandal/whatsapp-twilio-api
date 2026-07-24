@@ -104,13 +104,25 @@ async function parseBrief(text) {
   const c = client();
   if (!c) return { ok: false, error: "ANTHROPIC_API_KEY is not set on the WhatsApp service." };
 
+  // A hung request here is the worst failure this service has: the handler
+  // never reaches ANY of its reply paths, so the sender gets total silence and
+  // cannot tell whether the bot even heard them. Bounded twice — the SDK's own
+  // timeout, and a race as a backstop in case it does not fire.
+  const TIMEOUT_MS = parseInt(process.env.SOURCING_TIMEOUT_MS, 10) || 30000;
   try {
-    const msg = await c.messages.create({
+    const call = c.messages.create({
       model: model(),
       max_tokens: 900,
       system: SYSTEM,
       messages: [{ role: "user", content: `Today is ${new Date().toISOString().slice(0, 10)}.\n\nBrief:\n"""\n${text}\n"""` }],
-    });
+    }, { timeout: TIMEOUT_MS });
+
+    const msg = await Promise.race([
+      call,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`the model did not answer within ${TIMEOUT_MS / 1000}s`)), TIMEOUT_MS + 2000)
+      ),
+    ]);
     const raw = (msg.content || []).filter((b) => b.type === "text").map((b) => b.text).join(" ");
     const s = raw.indexOf("{");
     const e = raw.lastIndexOf("}");
