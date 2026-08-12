@@ -235,14 +235,14 @@ async function handleMessage(message) {
 
     case "/stuck": {
       const digest = await stuckLeads.buildStuckDigest();
-      return telegram.sendToChat(chatId, digest.text);
+      return telegram.sendToChat(chatId, digest.text, digest.buttons);
     }
 
     // Ignores STUCK_LEAD_MAX_AGE_DAYS. The daily message caps age so a fresh
     // deploy doesn't dump years of dead leads on you; this asks for all of it.
     case "/backlog": {
       const digest = await stuckLeads.buildStuckDigest({ maxAgeMs: Infinity });
-      return telegram.sendToChat(chatId, digest.text);
+      return telegram.sendToChat(chatId, digest.text, digest.buttons);
     }
 
     case "/takeover": {

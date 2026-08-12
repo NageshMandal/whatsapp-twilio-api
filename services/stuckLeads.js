@@ -192,15 +192,57 @@ const REASON_LABEL = {
 };
 
 // Human-readable conversation stage.
-const STEP_LABEL = {
-  intro: "Intro — confirming name & interest",
-  finance_understanding: "Checking finance understanding",
-  finance_explainer: "Finance explainer sent",
-  consent: "Waiting on soft-search consent",
-  apply: "Enquiry form link sent",
-  confirm_form: "Waiting for form completion",
-  handoff: "Handed off",
+// The qualification funnel, in order. `order` drives the "Stage 4 of 6" badge
+// so you can see at a glance how far a lead actually got — "consent" means
+// nothing on its own, "Stage 4 of 6" tells you they were nearly there.
+//
+// `stuck` says what the lead did NOT do. That is the line that tells whoever
+// picks up the phone what to open with, which is the whole point of the alert.
+const STAGES = {
+  intro: {
+    order: 1,
+    label: "Intro",
+    stuck: "never confirmed their name or that they still want a car",
+  },
+  finance_understanding: {
+    order: 2,
+    label: "Finance check",
+    stuck: "didn't say whether they understand how car finance works",
+  },
+  finance_explainer: {
+    order: 3,
+    label: "Finance explained",
+    stuck: "got the finance explainer, never replied to it",
+  },
+  consent: {
+    order: 4,
+    label: "Soft-search consent",
+    stuck: "won't confirm consent for the soft credit search",
+  },
+  apply: {
+    order: 5,
+    label: "Form sent",
+    stuck: "was sent the enquiry form link and never opened or returned it",
+  },
+  confirm_form: {
+    order: 6,
+    label: "Form completion",
+    stuck: "said they'd complete the form but hasn't finished it",
+  },
+  handoff: { order: 7, label: "Handed off", stuck: "already qualified" },
 };
+
+// Stages a lead passes through before qualifying (handoff is the finish line,
+// not a stage), so the badge reads "Stage 4 of 6" rather than "4 of 7".
+const TOTAL_STAGES = Object.values(STAGES).filter((st) => st.order < 7).length;
+
+const stageOf = (step) =>
+  STAGES[step] || { order: 0, label: step || "unknown", stuck: "stopped responding" };
+
+// Kept for anything still importing the old name.
+const STEP_LABEL = Object.fromEntries(
+  Object.entries(STAGES).map(([k, v]) => [k, v.label])
+);
 
 const e = telegram.escapeHtml;
 
@@ -253,6 +295,7 @@ async function buildStuckDigest({ now = Date.now(), maxAgeMs = MAX_AGE_MS } = {}
       empty: true,
       text: "✅ <b>No stuck leads.</b> Everything is either moving or already with a human.",
       leads: [],
+      buttons: [],
     };
   }
 
@@ -263,23 +306,79 @@ async function buildStuckDigest({ now = Date.now(), maxAgeMs = MAX_AGE_MS } = {}
   ];
 
   for (const f of stuck.slice(0, 40)) {
+    const stage = stageOf(f.step);
     const waLink = `https://wa.me/${f.phoneNumber.replace(/[^\d]/g, "")}`;
+    const name = f.customerName || "No name captured";
+
     lines.push(
-      `<b>${e(f.customerName || "Unknown")}</b> — <a href="${waLink}">${e(f.phoneNumber)}</a>`,
-      `   quiet ${e(formatDuration(f.silentMs))} · ${e(STEP_LABEL[f.step] || f.step)}`,
-      `   ${f.reason === "never_replied" ? "never replied" : "went silent"} · ${
-        f.followUpCount
-      }/5 nudges sent${f.windowClosed ? " · ⚠️ WhatsApp window shut, call them" : ""}`,
+      `<b>${e(name)}</b> — <a href="${waLink}">${e(f.phoneNumber)}</a>`,
+      `   📍 <b>Stage ${stage.order} of ${TOTAL_STAGES}</b> · ${e(stage.label)}`,
+      `   ⛔ ${e(
+        f.reason === "never_replied"
+          ? "never replied to a single message"
+          : stage.stuck
+      )}`,
+      `   ⏱ quiet ${e(formatDuration(f.silentMs))} · ${f.followUpCount}/5 nudges${
+        f.windowClosed ? " · ⚠️ WhatsApp shut, call them" : ""
+      }`,
       ""
     );
   }
 
   if (stuck.length > 40) lines.push(`<i>…and ${stuck.length - 40} more.</i>`, "");
 
-  lines.push("<i>/takeover +447... to stop the bot on one and handle it yourself.</i>");
+  // Be explicit when the buttons don't cover the whole list, otherwise it reads
+  // as leads silently missing their button.
+  lines.push(
+    stuck.length > 10
+      ? `<i>📋 buttons cover the first 10. /takeover +447... to handle one yourself.</i>`
+      : "<i>Tap 📋 to copy a lead. /takeover +447... to handle one yourself.</i>"
+  );
 
-  return { empty: false, text: lines.join("\n"), leads: stuck };
+  return {
+    empty: false,
+    text: lines.join("\n"),
+    leads: stuck,
+    buttons: buildCopyButtons(stuck),
+  };
 }
+
+/**
+ * One "copy" button per lead. Telegram's copy_text button puts the payload
+ * straight on the clipboard in a single tap — no long-press, no text selection,
+ * which is the difference between usable and not on a phone.
+ *
+ * Two hard limits shape this: copy_text.text caps at 256 characters, and a tall
+ * keyboard buries the message itself, so the buttons cover the first ten leads
+ * and the rest are reachable via the list above.
+ */
+function buildCopyButtons(leads, max = 10) {
+  return leads.slice(0, max).map((f) => {
+    const stage = stageOf(f.step);
+    const name = f.customerName || "No name captured";
+
+    const payload = [
+      name,
+      f.phoneNumber,
+      `Stage ${stage.order}/${TOTAL_STAGES} — ${stage.label}`,
+      `Stuck: ${
+        f.reason === "never_replied" ? "never replied to any message" : stage.stuck
+      }`,
+      `Quiet ${formatDuration(f.silentMs)}, ${f.followUpCount}/5 nudges${
+        f.windowClosed ? ", WhatsApp window closed — call them" : ""
+      }`,
+    ].join("\n");
+
+    return [
+      {
+        // Button labels are capped too, and a wrapped label looks broken.
+        text: `📋 ${name.slice(0, 24)}`,
+        copy_text: { text: payload.slice(0, 256) },
+      },
+    ];
+  });
+}
+
 
 /**
  * Send the daily list to every subscriber.
@@ -306,7 +405,7 @@ async function sendDailyDigest({ force = false, maxAgeMs = MAX_AGE_MS } = {}) {
     return { sent: 0, leads: 0 };
   }
 
-  const results = await telegram.broadcast(digest.text);
+  const results = await telegram.broadcast(digest.text, { buttons: digest.buttons });
   const delivered = results.filter((r) => r.ok).length;
 
   console.log(
@@ -356,6 +455,10 @@ module.exports = {
   buildStuckDigest,
   evaluateLead,
   formatDuration,
+  buildCopyButtons,
+  stageOf,
+  STAGES,
+  TOTAL_STAGES,
   dailyCronExpr,
   STUCK_AFTER_MS,
   MAX_AGE_MS,
