@@ -26,18 +26,21 @@
 // quiet again will alert again — which is the behaviour you want, because that
 // second silence is a different, later problem.
 //
-// .env
+// DELIVERY: one message a day, to whoever pressed /start on the bot. Not one
+// ping per lead — a list. A lead stays on the list every day until someone
+// takes it over, snoozes it, or it ages past STUCK_LEAD_MAX_AGE_DAYS, so a
+// missed day costs nothing.
+//
+// .env (all optional; defaults are fine)
+//   STUCK_LEAD_DAILY_TIME=09:00         when the daily list is sent
+//   STUCK_LEAD_TIMEZONE=Europe/London   what that time means
 //   STUCK_LEAD_HOURS=24                 how long counts as stuck
-//   STUCK_LEAD_CRON=*/15 * * * *        how often to sweep
 //   STUCK_LEAD_MAX_AGE_DAYS=14          ignore ancient leads on first deploy
-//   STUCK_LEAD_MAX_ALERTS=10            per-sweep cap, remainder is digested
-//   STUCK_LEAD_INCLUDE_SUMMARY=true     AI summary on each alert card
 // ---------------------------------------------------------------------------
 
 const cron = require("node-cron");
 const Message = require("../models/Message");
 const telegram = require("./telegram");
-const { summariseConversation } = require("./aiBrain");
 
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -49,19 +52,31 @@ const num = (value, fallback) => {
 };
 
 const STUCK_AFTER_MS = num(process.env.STUCK_LEAD_HOURS, 24) * HOUR;
-const MAX_AGE_MS = num(process.env.STUCK_LEAD_MAX_AGE_DAYS, 14) * DAY;
-const MAX_ALERTS_PER_SWEEP = num(process.env.STUCK_LEAD_MAX_ALERTS, 10);
-const CRON_EXPR = process.env.STUCK_LEAD_CRON || "*/15 * * * *";
-const INCLUDE_SUMMARY =
-  String(process.env.STUCK_LEAD_INCLUDE_SUMMARY || "true").toLowerCase() !== "false";
+// 0 (or "off") means no age limit at all — include the whole backlog.
+const RAW_MAX_AGE = process.env.STUCK_LEAD_MAX_AGE_DAYS;
+const MAX_AGE_MS =
+  RAW_MAX_AGE === "0" || String(RAW_MAX_AGE).toLowerCase() === "off"
+    ? Infinity
+    : num(RAW_MAX_AGE, 14) * DAY;
+const TIMEZONE = process.env.STUCK_LEAD_TIMEZONE || "Europe/London";
+
+// "09:00" -> the cron expression "0 9 * * *".
+function dailyCronExpr(timeStr) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(timeStr || "").trim());
+  if (!m) return "0 9 * * *";
+  const hour = Math.min(23, parseInt(m[1], 10));
+  const minute = Math.min(59, parseInt(m[2], 10));
+  return `${minute} ${hour} * * *`;
+}
+
+const DAILY_TIME = process.env.STUCK_LEAD_DAILY_TIME || "09:00";
+const CRON_EXPR = dailyCronExpr(DAILY_TIME);
 
 // WhatsApp's free-text session window. Past this, a plain message to the lead
 // will NOT deliver — the team needs an approved template or a phone call. The
 // alert says so explicitly, because "just WhatsApp them" is the natural
 // reaction and it silently fails.
 const WA_SESSION_WINDOW_MS = 24 * HOUR;
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------------------
 // Pure classification — no DB, no network, so it is trivially testable.
@@ -75,7 +90,7 @@ const ms = (date) => (date ? new Date(date).getTime() : 0);
  * @param {number} [now]  Epoch ms, injectable for tests.
  * @returns {null|object} null if healthy, otherwise the alert facts.
  */
-function evaluateLead(convo, now = Date.now()) {
+function evaluateLead(convo, now = Date.now(), maxAgeMs = MAX_AGE_MS) {
   if (!convo) return null;
 
   // A human already has it, or it already qualified — not our problem.
@@ -100,7 +115,7 @@ function evaluateLead(convo, now = Date.now()) {
 
   const ageMs = now - createdAt;
   if (ageMs < STUCK_AFTER_MS) return null;
-  if (ageMs > MAX_AGE_MS) return null; // ancient backlog, don't spam on deploy
+  if (ageMs > maxAgeMs) return null; // too old to be worth chasing
 
   // "Silent since" is their last inbound; if they never replied at all, count
   // from the first time we reached out.
@@ -187,78 +202,21 @@ const STEP_LABEL = {
   handoff: "Handed off",
 };
 
-// ---------------------------------------------------------------------------
-// Alert rendering
-// ---------------------------------------------------------------------------
-
 const e = telegram.escapeHtml;
 
-function buildAlertText(facts, summary) {
-  const lines = [
-    "🚨 <b>Stuck lead — no reply for " + e(formatDuration(facts.silentMs)) + "</b>",
-    "",
-    `<b>Name:</b> ${e(facts.customerName || "Unknown")}`,
-    `<b>Number:</b> <code>${e(facts.phoneNumber)}</code>`,
-    `<b>Stage:</b> ${e(STEP_LABEL[facts.step] || facts.step)}`,
-    `<b>Finance:</b> ${e(facts.financePreference || "Not specified")}`,
-    `<b>Why flagged:</b> ${e(REASON_LABEL[facts.reason] || facts.reason)}`,
-    `<b>Lead age:</b> ${e(formatDuration(facts.ageMs))}`,
-    `<b>Last heard from them:</b> ${e(
-      facts.reason === "never_replied" ? "never" : formatUkTime(facts.silentSince)
-    )}`,
-    `<b>Automated nudges sent:</b> ${facts.followUpCount} of 5`,
-  ];
-
-  if (facts.partExDetails) {
-    lines.push("", `<b>Part-ex given:</b> ${e(facts.partExDetails.slice(0, 200))}`);
-  }
-
-  if (facts.lastMessage) {
-    const who = facts.lastMessage.direction === "incoming" ? "Lead" : "Us";
-    lines.push("", `<b>Last message (${e(who)}):</b>`, `<i>${e(facts.lastMessage.text)}</i>`);
-  }
-
-  if (summary) {
-    lines.push("", "<b>Chat summary:</b>", e(summary));
-  }
-
-  if (facts.windowClosed) {
-    lines.push(
-      "",
-      "⚠️ <b>WhatsApp 24h window is closed.</b> A plain message will not deliver — use an approved template or call them."
-    );
-  }
-
-  return lines.join("\n");
-}
-
-// Inline keyboard. callback_data is capped at 64 bytes by Telegram; a phone
-// number plus a short verb sits comfortably inside that.
-function buildAlertButtons(facts) {
-  const phone = facts.phoneNumber;
-  return [
-    [
-      { text: "🙋 I'll take this one", callback_data: `takeover:${phone}` },
-      { text: "😴 Snooze 24h", callback_data: `snooze:${phone}` },
-    ],
-    [
-      {
-        text: "💬 Open WhatsApp",
-        url: `https://wa.me/${phone.replace(/[^\d]/g, "")}`,
-      },
-    ],
-  ];
-}
-
 // ---------------------------------------------------------------------------
-// Sweep
+// Finding stuck leads
 // ---------------------------------------------------------------------------
 
 /**
  * Find every stuck lead. Read-only — safe to call from an HTTP route.
  * @param {{ includeNotified?: boolean, now?: number }} [opts]
  */
-async function findStuckLeads({ includeNotified = false, now = Date.now() } = {}) {
+async function findStuckLeads({
+  includeNotified = false,
+  now = Date.now(),
+  maxAgeMs = MAX_AGE_MS,
+} = {}) {
   const cutoff = new Date(now - STUCK_AFTER_MS);
 
   // Narrow in Mongo first so the sweep stays cheap as the collection grows;
@@ -268,170 +226,140 @@ async function findStuckLeads({ includeNotified = false, now = Date.now() } = {}
     step: { $ne: "handoff" },
     status: "Lead",
     lastOutboundAt: { $ne: null, $lte: cutoff },
-    createdAt: { $lte: cutoff, $gte: new Date(now - MAX_AGE_MS) },
+    createdAt: Number.isFinite(maxAgeMs)
+      ? { $lte: cutoff, $gte: new Date(now - maxAgeMs) }
+      : { $lte: cutoff },
   };
   if (!includeNotified) query.stuckNotified = { $ne: true };
 
   const candidates = await Message.find(query).sort({ createdAt: 1 });
 
   return candidates
-    .map((convo) => evaluateLead(convo, now))
+    .map((convo) => evaluateLead(convo, now, maxAgeMs))
     .filter(Boolean);
 }
 
 /**
- * One pass: find stuck leads, alert Telegram, mark them notified.
- * @param {{ dryRun?: boolean }} [opts]
+ * Build the once-a-day message: every stuck lead, in one list.
+ *
+ * Deliberately NOT one alert per lead. Ten separate pings at 9am is noise
+ * people learn to swipe away; one list is something you read.
  */
-async function runStuckLeadSweep({ dryRun = false } = {}) {
-  if (!telegram.isConfigured()) return { skipped: "telegram-not-configured", alerted: 0 };
-
-  let stuck;
-  try {
-    stuck = await findStuckLeads();
-  } catch (err) {
-    console.error("❌ Stuck-lead query failed:", err.message);
-    return { error: err.message, alerted: 0 };
-  }
-
-  if (!stuck.length) return { alerted: 0, digested: 0 };
-
-  const detailed = stuck.slice(0, MAX_ALERTS_PER_SWEEP);
-  const overflow = stuck.slice(MAX_ALERTS_PER_SWEEP);
-  const notifiedNumbers = [];
-
-  for (const facts of detailed) {
-    let summary = null;
-    if (INCLUDE_SUMMARY) {
-      try {
-        const convo = await Message.findOne({ phoneNumber: facts.phoneNumber });
-        summary = await summariseConversation((convo && convo.messages) || []);
-      } catch (err) {
-        console.warn(`⚠️  Summary for ${facts.phoneNumber} failed:`, err.message);
-      }
-    }
-
-    if (dryRun) {
-      console.log("🧪 [dry run] would alert:", facts.phoneNumber, facts.reason);
-      continue;
-    }
-
-    const results = await telegram.sendTelegram(buildAlertText(facts, summary), {
-      chatIds: telegram.STUCK_CHATS,
-      buttons: buildAlertButtons(facts),
-    });
-
-    // Only mark notified if it actually landed somewhere, otherwise a transient
-    // Telegram outage would silently burn the one alert this lead ever gets.
-    if (results.some((r) => r.ok)) {
-      notifiedNumbers.push(facts.phoneNumber);
-    }
-
-    await sleep(400); // stay under the ~20 msg/min group limit
-  }
-
-  if (overflow.length && !dryRun) {
-    const lines = [
-      `📋 <b>${overflow.length} more stuck lead${overflow.length === 1 ? "" : "s"}</b>`,
-      "",
-      ...overflow.map(
-        (f) =>
-          `• <code>${e(f.phoneNumber)}</code> — ${e(f.customerName || "Unknown")}, quiet ${e(
-            formatDuration(f.silentMs)
-          )}`
-      ),
-      "",
-      "<i>Send /stuck for the full list.</i>",
-    ];
-    const results = await telegram.sendTelegram(lines.join("\n"), {
-      chatIds: telegram.STUCK_CHATS,
-    });
-    if (results.some((r) => r.ok)) {
-      notifiedNumbers.push(...overflow.map((f) => f.phoneNumber));
-    }
-  }
-
-  if (notifiedNumbers.length && !dryRun) {
-    await Message.updateMany(
-      { phoneNumber: { $in: notifiedNumbers } },
-      { $set: { stuckNotified: true, stuckNotifiedAt: new Date() } }
-    );
-  }
-
-  console.log(
-    `🚨 Stuck-lead sweep: ${detailed.length} alert(s), ${overflow.length} digested.`
-  );
-
-  return { alerted: detailed.length, digested: overflow.length, total: stuck.length };
-}
-
-/**
- * A compact list for the /stuck Telegram command and the REST endpoint.
- * Includes already-notified leads, since the point is "what is outstanding".
- */
-async function buildStuckDigest() {
-  const stuck = await findStuckLeads({ includeNotified: true });
+async function buildStuckDigest({ now = Date.now(), maxAgeMs = MAX_AGE_MS } = {}) {
+  const stuck = await findStuckLeads({ includeNotified: true, now, maxAgeMs });
 
   if (!stuck.length) {
-    return "✅ <b>No stuck leads.</b> Everything is either moving or already with a human.";
+    return {
+      empty: true,
+      text: "✅ <b>No stuck leads.</b> Everything is either moving or already with a human.",
+      leads: [],
+    };
   }
 
   const lines = [
-    `📋 <b>${stuck.length} stuck lead${stuck.length === 1 ? "" : "s"}</b>`,
+    `🚨 <b>${stuck.length} stuck lead${stuck.length === 1 ? "" : "s"}</b>`,
+    `<i>No reply for ${Math.round(STUCK_AFTER_MS / HOUR)}h+, never qualified.</i>`,
     "",
   ];
 
   for (const f of stuck.slice(0, 40)) {
+    const waLink = `https://wa.me/${f.phoneNumber.replace(/[^\d]/g, "")}`;
     lines.push(
-      `• <code>${e(f.phoneNumber)}</code> — ${e(f.customerName || "Unknown")}`,
-      `   quiet ${e(formatDuration(f.silentMs))} · ${e(f.step)} · ${f.followUpCount}/5 nudges${
-        f.windowClosed ? " · ⚠️ window closed" : ""
-      }`
+      `<b>${e(f.customerName || "Unknown")}</b> — <a href="${waLink}">${e(f.phoneNumber)}</a>`,
+      `   quiet ${e(formatDuration(f.silentMs))} · ${e(STEP_LABEL[f.step] || f.step)}`,
+      `   ${f.reason === "never_replied" ? "never replied" : "went silent"} · ${
+        f.followUpCount
+      }/5 nudges sent${f.windowClosed ? " · ⚠️ WhatsApp window shut, call them" : ""}`,
+      ""
     );
   }
 
-  if (stuck.length > 40) lines.push("", `<i>…and ${stuck.length - 40} more.</i>`);
-  return lines.join("\n");
+  if (stuck.length > 40) lines.push(`<i>…and ${stuck.length - 40} more.</i>`, "");
+
+  lines.push("<i>/takeover +447... to stop the bot on one and handle it yourself.</i>");
+
+  return { empty: false, text: lines.join("\n"), leads: stuck };
 }
 
 /**
- * Start the sweep on a cron. Uses a lock so a slow sweep (summaries are LLM
- * calls) never overlaps itself.
+ * Send the daily list to every subscriber.
+ * @param {{ force?: boolean }} [opts]  force = send even when there is nothing,
+ *                                      so a manual /stuck always gets a reply.
+ */
+async function sendDailyDigest({ force = false, maxAgeMs = MAX_AGE_MS } = {}) {
+  if (!telegram.isConfigured()) {
+    return { skipped: "no-telegram-token", sent: 0 };
+  }
+
+  let digest;
+  try {
+    digest = await buildStuckDigest({ maxAgeMs });
+  } catch (err) {
+    console.error("❌ Stuck-lead digest failed:", err.message);
+    return { error: err.message, sent: 0 };
+  }
+
+  // Nothing to report: stay quiet rather than sending "all clear" every
+  // morning, which is how a daily notification becomes background noise.
+  if (digest.empty && !force) {
+    console.log("✅ Daily stuck-lead check: nothing to report.");
+    return { sent: 0, leads: 0 };
+  }
+
+  const results = await telegram.broadcast(digest.text);
+  const delivered = results.filter((r) => r.ok).length;
+
+  console.log(
+    `📨 Daily stuck-lead list: ${digest.leads.length} lead(s) to ${delivered} subscriber(s).`
+  );
+
+  return { sent: delivered, leads: digest.leads.length };
+}
+
+/**
+ * Schedule the daily message. One lock so a slow run never overlaps itself.
  */
 function startStuckLeadCron() {
   if (!telegram.isConfigured()) {
-    console.log("📵 Stuck-lead alerts disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.");
+    console.log("📵 Daily lead alerts off — set TELEGRAM_BOT_TOKEN to enable.");
     return;
   }
 
   let running = false;
-  cron.schedule(CRON_EXPR, async () => {
-    if (running) return;
-    running = true;
-    try {
-      await runStuckLeadSweep();
-    } catch (err) {
-      console.error("❌ Stuck-lead cron error:", err.message);
-    } finally {
-      running = false;
-    }
-  });
+  cron.schedule(
+    CRON_EXPR,
+    async () => {
+      if (running) return;
+      running = true;
+      try {
+        await sendDailyDigest();
+      } catch (err) {
+        console.error("❌ Daily digest error:", err.message);
+      } finally {
+        running = false;
+      }
+    },
+    { timezone: TIMEZONE }
+  );
 
   console.log(
-    `⏰ Stuck-lead cron started (${CRON_EXPR}; flags leads quiet for ${
+    `⏰ Daily stuck-lead list scheduled for ${DAILY_TIME} ${TIMEZONE} (leads quiet ${
       STUCK_AFTER_MS / HOUR
-    }h).`
+    }h+).`
   );
 }
 
 module.exports = {
   startStuckLeadCron,
-  runStuckLeadSweep,
+  sendDailyDigest,
   findStuckLeads,
   buildStuckDigest,
   evaluateLead,
-  buildAlertText,
-  buildAlertButtons,
   formatDuration,
+  dailyCronExpr,
   STUCK_AFTER_MS,
+  MAX_AGE_MS,
+  CRON_EXPR,
+  DAILY_TIME,
+  TIMEZONE,
 };

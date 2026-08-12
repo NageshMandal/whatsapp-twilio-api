@@ -7,6 +7,14 @@ const LeadToMessage = require("./models/LeadToMessage");
 const { generateReply, MODEL, SCRIPTS } = require("./services/aiBrain");
 const { notifyHandoff, notifyPartEx, notifyEscalation } = require("./services/notifications");
 const { startFollowUpCron } = require("./services/followUps");
+const telegram = require("./services/telegram");
+const telegramCommands = require("./services/telegramCommands");
+const telegramAccess = require("./services/telegramAccess");
+const {
+  startStuckLeadCron,
+  sendDailyDigest,
+  findStuckLeads,
+} = require("./services/stuckLeads");
 const { isAuthorizedSubmitter, parseLeadSubmission } = require("./services/leadIntake");
 const SourcingRequest = require("./models/SourcingRequest");
 const { looksLikeCarBrief, parseBrief, summariseBrief, startScrape } = require("./services/carSourcing");
@@ -634,11 +642,19 @@ app.post("/webhook/whatsapp", async (req, res) => {
     // 1) Save the incoming message and read current state.
     //    Reset followUpCount to 0 — the lead just replied, so the daily nudge
     //    schedule starts fresh from our next outbound message.
+    //    Reset stuckNotified too: this lead is alive again, so if they go quiet
+    //    a second time the team should be told a second time.
     let convo = await Message.findOneAndUpdate(
       { phoneNumber },
       {
         $push: { messages: { text: incomingText, direction: "incoming", isBot: false } },
-        $set: { lastInboundAt: new Date(), followUpCount: 0 },
+        $set: {
+          lastInboundAt: new Date(),
+          followUpCount: 0,
+          stuckNotified: false,
+          stuckNotifiedAt: null,
+          stuckSnoozedUntil: null,
+        },
         $setOnInsert: { step: "intro", status: "Lead", botActive: true },
       },
       { upsert: true, returnDocument: "after" }
@@ -840,6 +856,106 @@ app.post("/webhook/whatsapp", async (req, res) => {
   } catch (error) {
     console.error("❌ Webhook Error:", error);
     ackEmpty(); // never leave Twilio hanging
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Telegram diagnostics.
+//
+// Answers "I pressed /start and nothing happened" without needing the server
+// logs. The decisive field is `updatesReceived`: if it is 0 the bot never heard
+// you (token or connectivity), if it is >0 you were heard and refused (your
+// number is not on the allowlist, or is written in a format that didn't match).
+// ---------------------------------------------------------------------------
+app.get("/telegram/status", async (_req, res) => {
+  try {
+    const diag = telegram.getDiagnostics();
+
+    // The subscriber list is the least important field here, and a diagnostics
+    // endpoint that dies when the database does is useless precisely when you
+    // need it. So a DB failure degrades to a reported problem, not a 500.
+    let subs = [];
+    let dbError = null;
+    // readyState 1 = connected. Checking first avoids a 10s Mongoose buffering
+    // timeout on an endpoint whose whole job is to answer quickly.
+    if (mongoose.connection.readyState !== 1) {
+      dbError = "not connected to MongoDB";
+    } else {
+      try {
+        subs = await require("./models/TelegramSubscriber").find({});
+      } catch (err) {
+        dbError = err.message;
+      }
+    }
+
+    const problems = [];
+    if (dbError) problems.push(`Database unreachable: ${dbError}`);
+    if (!process.env.TELEGRAM_BOT_TOKEN) problems.push("TELEGRAM_BOT_TOKEN is not set in .env");
+    if (!telegramAccess.hasAllowlist())
+      problems.push("TELEGRAM_ALLOWED_NUMBERS is empty — nobody can use the bot");
+    if (!diag.polling)
+      problems.push("The bot is not polling — the token was rejected, or the app needs a restart");
+    if (diag.polling && diag.updatesReceived === 0)
+      problems.push(
+        "No messages received yet. Press /start in Telegram. If still nothing, the token belongs to a different bot than the one you messaged"
+      );
+    if (diag.updatesReceived > 0 && subs.length === 0 && !dbError)
+      problems.push(
+        "Messages ARE arriving but nobody is verified — the number that pressed /start is not in TELEGRAM_ALLOWED_NUMBERS. Compare it with allowedNumbers below"
+      );
+
+    res.json({
+      success: true,
+      tokenSet: Boolean(process.env.TELEGRAM_BOT_TOKEN),
+      bot: diag.botUsername ? `@${diag.botUsername}` : null,
+      polling: diag.polling,
+      updatesReceived: diag.updatesReceived,
+      lastUpdateAt: diag.lastUpdateAt,
+      lastUpdateFromChat: diag.lastUpdateFrom,
+      lastError: diag.lastError,
+      allowedNumbers: telegramAccess.listAllowed(),
+      verifiedSubscribers: subs.map((s) => ({
+        chatId: s.chatId,
+        number: telegramAccess.displayNumber(s.phoneNumber),
+        name: s.firstName,
+        active: s.active,
+        stillAllowed: telegramAccess.isAllowedNumber(s.phoneNumber),
+      })),
+      problems,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Stuck leads: leads that haven't qualified and have gone quiet for 24h+.
+//
+// There is no Telegram webhook route — the bot uses long polling, so it needs
+// no public URL and no inbound firewall rule. See services/telegram.js.
+// ---------------------------------------------------------------------------
+
+// Read-only view of who is on the list. `?all=true` ignores the age limit, so
+// you can see the entire backlog including leads older than 14 days.
+app.get("/stuck-leads", async (req, res) => {
+  try {
+    const maxAgeMs = String(req.query.all || "") === "true" ? Infinity : undefined;
+    const leads = await findStuckLeads({ includeNotified: true, maxAgeMs });
+    res.json({ success: true, count: leads.length, data: leads });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Send the list now instead of waiting for the scheduled time.
+// `?all=true` includes the whole backlog regardless of age.
+app.post("/stuck-leads/send", async (req, res) => {
+  try {
+    const maxAgeMs = String(req.query.all || "") === "true" ? Infinity : undefined;
+    const result = await sendDailyDigest({ force: true, maxAgeMs });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -1122,4 +1238,12 @@ app.listen(PORT, () => {
 
   // Feature 2: start the follow-up cron (nudges quiet leads at 30m / 2h / 1d).
   startFollowUpCron({ sendWhatsApp });
+
+  // Feature 3: the daily Telegram list of leads that went quiet and never
+  // qualified. Long polling, so no public URL is needed — just the bot token.
+  startStuckLeadCron();
+  if (telegram.isConfigured()) telegramAccess.logAccessConfig();
+  telegram
+    .startPolling(telegramCommands.handleUpdate)
+    .catch((err) => console.error("❌ Telegram polling failed to start:", err.message));
 });
