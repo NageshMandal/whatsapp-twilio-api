@@ -3,23 +3,22 @@
 // The bot's side of the conversation.
 //
 // ACCESS
-//   Only the phone numbers in TELEGRAM_ALLOWED_NUMBERS can use this bot. On
-//   /start the bot asks the person to share their number via Telegram's own
-//   "Share my number" button, checks it against the list, and subscribes them
-//   if it matches.
+//   Telegram identifies the sender on every message, so there is no signup
+//   step: press /start and you are either on the TELEGRAM_ALLOWED_USERS list or
+//   you are not. Nobody types a number, nobody taps a verification button.
 //
-//   Anyone else — an unlisted number, a forwarded contact card, or someone who
-//   just types at the bot — gets NOTHING. No reply, no error, no hint that the
-//   bot is live. Silence is deliberate: an error message confirms to a stranger
-//   that they have found a real, working bot worth probing.
+//   Anyone not on the list gets NOTHING — no reply, no error, no hint the bot
+//   is live. An error message would confirm to a stranger that they have found
+//   a real, working bot worth probing.
 //
-// COMMANDS (subscribers only)
+// COMMANDS
 //   /start      subscribe
-//   /stuck      show stuck leads now
+//   /stuck      leads quiet 24h+ (last 14 days)
+//   /backlog    same, but every old lead too
 //   /takeover <number>   stop the bot on that lead, you are handling it
 //   /resume <number>     hand it back to the bot
 //   /stop       stop notifications
-//   /who        who else has access
+//   /who        who has access
 //   /help
 // ---------------------------------------------------------------------------
 
@@ -28,17 +27,6 @@ const TelegramSubscriber = require("../models/TelegramSubscriber");
 const telegram = require("./telegram");
 const access = require("./telegramAccess");
 const stuckLeads = require("./stuckLeads");
-
-// Telegram's "Share my number" button (request_contact) is only implemented in
-// the mobile apps — on Telegram Desktop it silently does not render. This flag
-// lets a desktop-only user TYPE their number instead.
-//
-// It is weaker: a typed number is a claim, not proof, so anyone who knows one of
-// the allowed numbers could subscribe with it. The bot token is secret, so that
-// means someone who already has the token — but it is a real downgrade, which is
-// why it is off unless you turn it on.
-const ALLOW_TYPED_NUMBER =
-  String(process.env.TELEGRAM_ALLOW_TYPED_NUMBER || "false").toLowerCase() === "true";
 
 const e = telegram.escapeHtml;
 
@@ -49,15 +37,14 @@ const HELP = [
   "",
   "<b>Commands</b>",
   "/stuck — show them right now",
-  "/backlog — same, but every old lead too (no 14-day limit)",
+  "/backlog — same, plus every old lead (no 14-day limit)",
   "/takeover <code>+447...</code> — stop the bot, you're handling that lead",
   "/resume <code>+447...</code> — hand it back to the bot",
   "/stop — stop notifications",
-  "/who — who else has access",
+  "/who — who has access",
 ].join("\n");
 
-// Lead phone numbers, as typed into a command. Kept separate from
-// access.normaliseNumber because leads are stored in E.164 with the plus.
+// Lead phone numbers, as typed into a command.
 function normaliseLeadPhone(raw, defaultCountry = process.env.DEFAULT_COUNTRY_CODE || "+44") {
   if (!raw) return null;
   const s = String(raw).trim().replace(/[\s()\-.]/g, "");
@@ -69,136 +56,42 @@ function normaliseLeadPhone(raw, defaultCountry = process.env.DEFAULT_COUNTRY_CO
 }
 
 // ---------------------------------------------------------------------------
-// Access
+// Subscription
 // ---------------------------------------------------------------------------
 
 /**
- * Is this chat a live, still-allowed subscriber?
- *
- * The env allowlist is re-checked here, not just at signup. That way pulling a
- * number out of .env locks that person out on the next restart, without anyone
- * having to remember to clean up the database.
+ * Record where to send this person's notifications. Called on /start once they
+ * have already passed the allowlist check — this function does not gate access,
+ * it only remembers the chat id.
  */
-async function activeSubscriber(chatId) {
-  const sub = await TelegramSubscriber.findOne({ chatId: String(chatId) });
-  if (!sub || !sub.active) return null;
-  if (!access.isAllowedNumber(sub.phoneNumber)) {
-    console.warn(
-      `🔒 ${access.displayNumber(sub.phoneNumber)} is no longer in TELEGRAM_ALLOWED_NUMBERS — access revoked.`
-    );
-    return null;
-  }
-  return sub;
-}
-
-/**
- * /start from someone we don't know yet: ask for their number using Telegram's
- * share-contact button. request_contact only works in a private chat, which is
- * fine — this bot is a direct message tool.
- */
-async function askForNumber(chatId) {
-  return telegram.callApi("sendMessage", {
-    chat_id: chatId,
-    text:
-      "👋 To use this bot, tap the button below to confirm your number.\n\n" +
-      "Only approved numbers can access lead data." +
-      (ALLOW_TYPED_NUMBER
-        ? "\n\n💻 No button? You're on Telegram Desktop, which doesn't support it. Just type your number instead, e.g. +447700900123"
-        : "\n\n💻 No button? Telegram Desktop doesn't support this — open the bot on your phone once, and Desktop will work afterwards."),
-    reply_markup: {
-      keyboard: [[{ text: "📱 Share my number", request_contact: true }]],
-      resize_keyboard: true,
-      one_time_keyboard: true,
-    },
-  });
-}
-
-/**
- * A contact card arrived. Verify it really belongs to the sender, check the
- * number against the allowlist, and subscribe on success.
- */
-async function handleContact(message) {
+async function rememberChat(message) {
   const chatId = String(message.chat.id);
-  const check = access.verifyContact(message);
-
-  if (!check.ok) {
-    // Forwarded someone else's contact, or something unreadable. Say nothing.
-    console.warn(`🚫 Telegram contact rejected from chat ${chatId}: ${check.reason}`);
-    return;
-  }
-
-  return grantAccess(message, check.number, "shared-contact");
-}
-
-/**
- * Desktop fallback: the user typed a number rather than sharing a contact.
- * Only reachable when TELEGRAM_ALLOW_TYPED_NUMBER=true.
- */
-async function handleTypedNumber(message) {
-  const chatId = String(message.chat.id);
-
-  // resolveTypedNumber also matches a number typed without its country code,
-  // which is what people naturally do.
-  const number = access.resolveTypedNumber(message.text);
-
-  if (!number) {
-    console.warn(
-      `🚫 Telegram: typed number from chat ${chatId} is not in TELEGRAM_ALLOWED_NUMBERS`
-    );
-    return;
-  }
-  return grantAccess(message, number, "typed");
-}
-
-/**
- * Check a number against the allowlist and subscribe on success.
- * Shared by both routes so the allowlist decision lives in exactly one place.
- */
-async function grantAccess(message, number, method) {
-  const chatId = String(message.chat.id);
-  const check = { number };
-
-  if (!access.isAllowedNumber(check.number)) {
-    console.warn(
-      `🚫 Telegram access denied for ${access.displayNumber(check.number)} (chat ${chatId}) — not in TELEGRAM_ALLOWED_NUMBERS.`
-    );
-    return; // silence
-  }
+  const from = message.from || {};
 
   const existing = await TelegramSubscriber.findOne({ chatId });
+
   if (existing) {
     await TelegramSubscriber.updateOne(
       { chatId },
-      { $set: { active: true, phoneNumber: check.number } }
+      {
+        $set: {
+          active: true,
+          userId: String(from.id || existing.userId || ""),
+          username: from.username || null,
+          firstName: from.first_name || null,
+        },
+      }
     );
-  } else {
-    await TelegramSubscriber.create({
-      chatId,
-      phoneNumber: check.number,
-      firstName: message.from?.first_name || null,
-      username: message.from?.username || null,
-    });
+    return false; // already known
   }
 
-  console.log(
-    `✅ Telegram access granted to ${access.displayNumber(check.number)} (${
-      message.from?.first_name || chatId
-    }) via ${method}`
-  );
-
-  // Drop the share-number keyboard now that it has served its purpose.
-  await telegram.callApi("sendMessage", {
-    chat_id: chatId,
-    text: [
-      `✅ <b>Verified ${e(access.displayNumber(check.number))}</b>`,
-      "",
-      "You'll get the stuck-lead list once a day.",
-      "",
-      HELP,
-    ].join("\n"),
-    parse_mode: "HTML",
-    reply_markup: { remove_keyboard: true },
+  await TelegramSubscriber.create({
+    chatId,
+    userId: String(from.id || ""),
+    username: from.username || null,
+    firstName: from.first_name || null,
   });
+  return true; // newly subscribed
 }
 
 async function unsubscribe(chatId) {
@@ -208,24 +101,17 @@ async function unsubscribe(chatId) {
 
 async function whoHasAccess() {
   const subs = await TelegramSubscriber.find({ active: true });
-  const live = subs.filter((s) => access.isAllowedNumber(s.phoneNumber));
 
-  const lines = ["<b>Access</b>", ""];
+  const lines = ["<b>Access</b>", "", "<i>Allowed in .env:</i>"];
+  for (const entry of access.listAllowed()) lines.push(`• ${e(entry)}`);
 
-  if (live.length) {
-    lines.push("<i>Signed in:</i>");
-    for (const s of live) {
-      lines.push(`✅ ${e(s.firstName || "")} ${e(access.displayNumber(s.phoneNumber))}`.trim());
+  lines.push("", "<i>Signed in:</i>");
+  if (!subs.length) {
+    lines.push("(nobody yet — they need to press /start)");
+  } else {
+    for (const s of subs) {
+      lines.push(`✅ ${e(s.username ? "@" + s.username : s.firstName || s.chatId)}`);
     }
-  }
-
-  // Numbers allowed in .env that nobody has claimed yet — usually someone who
-  // hasn't pressed /start, which is the common "why am I not getting these".
-  const claimed = new Set(live.map((s) => access.displayNumber(s.phoneNumber)));
-  const waiting = access.listAllowed().filter((n) => !claimed.has(n));
-  if (waiting.length) {
-    lines.push("", "<i>Allowed but not signed in yet:</i>");
-    waiting.forEach((n) => lines.push(`⏳ ${e(n)}`));
   }
 
   return lines.join("\n");
@@ -288,7 +174,8 @@ async function handleUpdate(update) {
 async function handleCallback(query) {
   const chatId = query.message?.chat?.id;
 
-  if (!(await activeSubscriber(chatId))) {
+  if (!access.isAllowedUser(query.from)) {
+    console.warn(`🚫 Telegram button press from ${access.describeUser(query.from)} — ignored.`);
     return telegram.answerCallback(query.id, "");
   }
 
@@ -306,46 +193,37 @@ async function handleCallback(query) {
 }
 
 async function handleMessage(message) {
-  const chat = message.chat || {};
-  const chatId = String(chat.id);
-
-  // A shared contact card — the answer to our /start prompt.
-  if (message.contact) return handleContact(message);
-
+  const chatId = String(message.chat.id);
+  const from = message.from || {};
   const text = (message.text || "").trim();
 
-  // Not a command. The only non-command text the bot acts on is a typed phone
-  // number from someone not yet subscribed, and only if that fallback is on.
-  if (!text.startsWith("/")) {
-    if (!ALLOW_TYPED_NUMBER) return;
-    if (await activeSubscriber(chatId)) return; // already in, nothing to do
-    if (!/[\d]{6,}/.test(text)) return; // not number-shaped, ignore silently
-    return handleTypedNumber(message);
+  // The single access check. Telegram already told us who this is.
+  if (!access.isAllowedUser(from)) {
+    // Logged with BOTH identifiers so whichever you want to paste into
+    // TELEGRAM_ALLOWED_USERS is right there in the log.
+    console.warn(
+      `🚫 Telegram: ${access.describeUser(from)} is not in TELEGRAM_ALLOWED_USERS — ignored.`
+    );
+    return;
   }
+
+  if (!text.startsWith("/")) return; // ignore ordinary chatter
 
   const [rawCmd, ...args] = text.split(/\s+/);
   const cmd = rawCmd.split("@")[0].toLowerCase();
   const arg = args.join(" ").trim();
 
-  const sub = await activeSubscriber(chatId);
-
-  // /start is the only thing an unknown chat can do, and all it gets is the
-  // share-number prompt. If their number isn't on the list, that is where it
-  // ends — silently.
-  if (!sub) {
-    if (cmd === "/start") {
-      if (!access.hasAllowlist()) {
-        console.warn("🚫 /start ignored — TELEGRAM_ALLOWED_NUMBERS is empty, nobody is allowed.");
-        return;
-      }
-      return askForNumber(chatId);
-    }
-    console.warn(`🚫 Telegram "${cmd}" from unauthorised chat ${chatId} — ignored.`);
-    return;
-  }
-
   switch (cmd) {
-    case "/start":
+    case "/start": {
+      const isNew = await rememberChat(message);
+      return telegram.sendToChat(
+        chatId,
+        isNew
+          ? `✅ <b>You're set up${from.first_name ? ", " + e(from.first_name) : ""}.</b>\n\n${HELP}`
+          : HELP
+      );
+    }
+
     case "/help":
       return telegram.sendToChat(chatId, HELP);
 
@@ -360,9 +238,8 @@ async function handleMessage(message) {
       return telegram.sendToChat(chatId, digest.text);
     }
 
-    // Same list, but ignoring STUCK_LEAD_MAX_AGE_DAYS. The daily message caps
-    // age so a fresh deploy doesn't dump two years of dead leads on you; this
-    // is the deliberate way to ask for all of it.
+    // Ignores STUCK_LEAD_MAX_AGE_DAYS. The daily message caps age so a fresh
+    // deploy doesn't dump years of dead leads on you; this asks for all of it.
     case "/backlog": {
       const digest = await stuckLeads.buildStuckDigest({ maxAgeMs: Infinity });
       return telegram.sendToChat(chatId, digest.text);
@@ -389,11 +266,7 @@ async function handleMessage(message) {
 
 module.exports = {
   handleUpdate,
-  handleContact,
-  handleTypedNumber,
-  grantAccess,
-  askForNumber,
-  activeSubscriber,
+  rememberChat,
   unsubscribe,
   whoHasAccess,
   normaliseLeadPhone,
