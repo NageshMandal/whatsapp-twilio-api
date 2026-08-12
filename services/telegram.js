@@ -1,49 +1,35 @@
 // services/telegram.js
 // ---------------------------------------------------------------------------
-// Telegram transport for INTERNAL team alerts.
+// Telegram transport.
 //
-// RECIPIENT POLICY (the important part):
-//   Alerts go ONLY to the chat IDs listed in TELEGRAM_CHAT_ID. Nothing else can
-//   ever receive one. This is enforced in ONE place — resolveTargets() — which
-//   every outbound message funnels through, so a bug or a bad caller elsewhere
-//   in the app still cannot leak a lead's details to an unlisted chat. Anyone
-//   who finds the bot and messages it gets silence.
+// SETUP IS ONE LINE:
 //
-//   The list is also fail-CLOSED: an empty or unset TELEGRAM_CHAT_ID sends to
-//   nobody, rather than falling back to "everyone".
+//   TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 //
-// A NOTE ON PHONE NUMBERS:
-//   Telegram has no way to message a phone number. Unlike WhatsApp, a bot
-//   cannot open a conversation with a person — the person must message the bot
-//   first (or be in a group with it). What you put in TELEGRAM_CHAT_ID is a
-//   numeric CHAT ID, not a phone number. Each teammate sends /myid to the bot
-//   once, and you paste the number it replies with into .env. See
-//   TELEGRAM_SETUP.md.
+// That is all. No chat IDs, no webhook URL, no secret. You open the bot in
+// Telegram, press /start, and you are subscribed — the bot reads your chat id
+// off that message and stores it. Nothing to paste into .env, nothing to
+// redeploy when someone else joins.
 //
-// Why Telegram and not another WhatsApp number:
-//   1. Twilio's WhatsApp API cannot post into a group chat, so every internal
-//      alert today has to be fanned out to individual phones (see
-//      notifications.js). Telegram posts straight into a group or a topic
-//      inside a supergroup, so the whole team sees one thread.
-//   2. WhatsApp's 24-hour session window means a free-text alert to a teammate
-//      only delivers if THEY messaged the bot in the last day — otherwise you
-//      need a Meta-approved template. Telegram has no such window and no
-//      template approval, which matters here because a "stuck lead" alert is
-//      by definition fired at least 24h after anyone last spoke.
+// HOW IT RECEIVES MESSAGES
+//   By long polling (getUpdates), not a webhook. Polling needs no public URL,
+//   no TLS certificate and no inbound firewall rule, which is what let the
+//   whole PUBLIC_BASE_URL / webhook-secret setup go away. If PUBLIC_BASE_URL
+//   is set the webhook route still works, but nothing requires it.
 //
-// Everything degrades gracefully: if TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are
-// unset, every function here becomes a logged no-op.
+// WHO RECEIVES ALERTS
+//   Only the phone numbers in TELEGRAM_ALLOWED_NUMBERS. A person presses
+//   /start, shares their number through Telegram's own verified button, and is
+//   subscribed if it matches. Everyone else gets silence.
 //
-// .env
-//   TELEGRAM_BOT_TOKEN=123456:ABC-DEF...            (from @BotFather)
-//   TELEGRAM_CHAT_ID=-1001234567890,987654321       (the ONLY recipients)
-//   TELEGRAM_STUCK_CHAT_ID=-1001234567890:12        (optional; ":12" = topic id)
-//   TELEGRAM_WEBHOOK_SECRET=some-long-random-string (for /webhook/telegram)
-//   TELEGRAM_MIRROR_ALERTS=true                     (also mirror WA alerts here)
-//   TELEGRAM_ALLOW_ID_LOOKUP=true                   (let anyone run /myid)
+//   The allowlist is re-checked on every broadcast, not just at signup — so
+//   deleting a number from .env and restarting cuts that person off on the
+//   spot, with no stale database row left quietly forwarding customer details.
 // ---------------------------------------------------------------------------
 
 const axios = require("axios");
+const TelegramSubscriber = require("../models/TelegramSubscriber");
+const access = require("./telegramAccess");
 
 const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const API_BASE = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
@@ -53,138 +39,15 @@ const MAX_MESSAGE_CHARS = 3500;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---------------------------------------------------------------------------
-// Recipient parsing
-//
-// Entry format:  [label=]chatId[:threadId]
-//
-//   -1001234567890                  a group
-//   Sales=-1001234567890:12         a topic inside a supergroup, labelled
-//   Josiah=987654321                one person (they must /start the bot first)
-//
-// The chat id can be negative, so the thread id is split from the RIGHT and
-// only accepted when the tail is a plain integer.
-// ---------------------------------------------------------------------------
-function parseChatTargets(value) {
-  return (value || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((entry) => {
-      let label = null;
-      let rest = entry;
-
-      const eq = entry.indexOf("=");
-      if (eq > 0) {
-        label = entry.slice(0, eq).trim() || null;
-        rest = entry.slice(eq + 1).trim();
-      }
-
-      let chatId = rest;
-      let threadId = null;
-
-      const idx = rest.lastIndexOf(":");
-      if (idx > 0) {
-        const head = rest.slice(0, idx).trim();
-        const tail = rest.slice(idx + 1).trim();
-        if (/^\d+$/.test(tail)) {
-          chatId = head;
-          threadId = parseInt(tail, 10);
-        }
-      }
-
-      return { chatId: String(chatId).trim(), threadId, label: label || String(chatId).trim() };
-    })
-    .filter((t) => /^-?\d+$/.test(t.chatId)); // ids are numeric; drop typos loudly below
-}
-
-// Warn about entries that were dropped, so a typo'd id is visible at boot
-// rather than showing up as silence three days later.
-function reportBadEntries(value, parsed, varName) {
-  const rawCount = (value || "").split(",").map((s) => s.trim()).filter(Boolean).length;
-  if (rawCount > parsed.length) {
-    console.warn(
-      `⚠️  ${varName}: ${rawCount - parsed.length} entr${
-        rawCount - parsed.length === 1 ? "y was" : "ies were"
-      } ignored — a chat id must be numeric (e.g. -1001234567890), not a phone number or @username.`
-    );
-  }
-}
-
-const RAW_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const RAW_STUCK_CHAT_ID = process.env.TELEGRAM_STUCK_CHAT_ID || "";
-
-// THE allowlist. Every outbound message is filtered against this.
-const RECIPIENTS = parseChatTargets(RAW_CHAT_ID);
-reportBadEntries(RAW_CHAT_ID, RECIPIENTS, "TELEGRAM_CHAT_ID");
-
-// Optional narrower destination for stuck-lead alerts. Falls back to the main
-// list, so the common single-group setup needs only TELEGRAM_CHAT_ID.
-const STUCK_RECIPIENTS = RAW_STUCK_CHAT_ID
-  ? parseChatTargets(RAW_STUCK_CHAT_ID)
-  : RECIPIENTS;
-if (RAW_STUCK_CHAT_ID) {
-  reportBadEntries(RAW_STUCK_CHAT_ID, STUCK_RECIPIENTS, "TELEGRAM_STUCK_CHAT_ID");
-}
-
-// Every id that is allowed to receive anything: the union of both lists.
-// Nothing outside this set is ever sent to.
-const ALLOWED_IDS = new Set(
-  [...RECIPIENTS, ...STUCK_RECIPIENTS].map((t) => String(t.chatId))
-);
-
-// Commands are restricted to the same set — the people who get the alerts are
-// the people who can act on them. TELEGRAM_ALLOWED_CHAT_IDS can narrow it
-// further (e.g. alerts to a big group, commands only from managers).
-const COMMAND_IDS = process.env.TELEGRAM_ALLOWED_CHAT_IDS
-  ? new Set(parseChatTargets(process.env.TELEGRAM_ALLOWED_CHAT_IDS).map((t) => String(t.chatId)))
-  : ALLOWED_IDS;
-
-const WEBHOOK_SECRET = (process.env.TELEGRAM_WEBHOOK_SECRET || "").trim();
-
-const MIRROR_ALERTS =
-  String(process.env.TELEGRAM_MIRROR_ALERTS || "true").toLowerCase() !== "false";
-
-// /myid has to work for people who are NOT yet in the list — that is the whole
-// point of it, it is how they find the number to give you. It reveals nothing
-// but the caller's own chat id. Set false to lock the bot down completely.
-const ALLOW_ID_LOOKUP =
-  String(process.env.TELEGRAM_ALLOW_ID_LOOKUP || "true").toLowerCase() !== "false";
-
-const isConfigured = () => Boolean(TOKEN && RECIPIENTS.length);
-
-// Fail CLOSED. An empty allowlist authorises nobody.
-const isAllowedChat = (chatId) => ALLOWED_IDS.has(String(chatId));
-const isAllowedCommandChat = (chatId) => COMMAND_IDS.has(String(chatId));
-
-/**
- * The single choke point for "who may receive a message".
- * Anything not on the allowlist is dropped and logged.
- */
-function resolveTargets(chatIds) {
-  const requested = chatIds && chatIds.length ? chatIds : RECIPIENTS;
-
-  const allowed = [];
-  for (const target of requested) {
-    if (isAllowedChat(target.chatId)) {
-      allowed.push(target);
-    } else {
-      console.warn(
-        `🚫 Telegram: refusing to send to ${target.chatId} — not in TELEGRAM_CHAT_ID.`
-      );
-    }
-  }
-  return allowed;
-}
+const isConfigured = () => Boolean(TOKEN);
 
 // ---------------------------------------------------------------------------
-// Formatting helpers
+// Formatting
 // ---------------------------------------------------------------------------
 
-// We use parse_mode=HTML rather than MarkdownV2 because HTML needs only three
-// characters escaped, whereas MarkdownV2 requires escaping 18 of them —
-// including "-", "." and "+", all of which appear constantly in phone numbers,
-// registrations and free-text customer messages.
+// parse_mode=HTML rather than MarkdownV2: HTML needs three characters escaped,
+// MarkdownV2 needs eighteen — including "-", "." and "+", which appear in every
+// phone number and registration we send.
 function escapeHtml(value) {
   return String(value == null ? "" : value)
     .replace(/&/g, "&amp;")
@@ -192,8 +55,8 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;");
 }
 
-// Split on paragraph then line boundaries so a long chat summary never gets
-// cut mid-tag (which would make Telegram reject the whole message).
+// Split on paragraph then line boundaries so a long list never gets cut
+// mid-tag, which would make Telegram reject the whole message.
 function chunkText(text, max = MAX_MESSAGE_CHARS) {
   const out = [];
   let remaining = String(text || "");
@@ -209,44 +72,37 @@ function chunkText(text, max = MAX_MESSAGE_CHARS) {
   return out.length ? out : [""];
 }
 
-// Telegram's errors are terse. Translate the two that actually happen in this
-// setup into something that says what to do about it.
+// Telegram's errors are terse. Translate the ones that actually happen.
 function explainError(description, chatId) {
   const d = String(description || "");
-
-  if (/bot can't initiate conversation/i.test(d)) {
-    return `${chatId} has never messaged the bot. Telegram does not let a bot open a chat — ask them to send /start to the bot, then re-add their id.`;
+  if (/bot was blocked by the user/i.test(d)) {
+    return `${chatId} has blocked the bot. They need to unblock it and press /start again.`;
   }
   if (/chat not found/i.test(d)) {
-    return `${chatId} was not found. Check the id is the numeric chat id (negative for groups), and that the bot is a member of that group.`;
-  }
-  if (/bot was kicked|bot is not a member/i.test(d)) {
-    return `The bot has been removed from ${chatId}. Re-add it as an admin.`;
+    return `${chatId} no longer exists — the subscription will be deactivated.`;
   }
   return d;
 }
 
 // ---------------------------------------------------------------------------
-// Low-level API call
+// API
 // ---------------------------------------------------------------------------
-async function callApi(method, payload, { retryOn429 = true } = {}) {
+async function callApi(method, payload, { retryOn429 = true, timeout = 15000 } = {}) {
   if (!API_BASE) throw new Error("TELEGRAM_BOT_TOKEN is not set");
 
   try {
-    const { data } = await axios.post(`${API_BASE}/${method}`, payload, {
-      timeout: 15000,
-    });
+    const { data } = await axios.post(`${API_BASE}/${method}`, payload, { timeout });
     return data.result;
   } catch (err) {
     const body = err.response?.data;
 
-    // 429: Telegram tells us exactly how long to wait. Groups are limited to
-    // ~20 messages/minute, which a large sweep can brush against.
+    // Telegram tells us exactly how long to wait. Worth honouring: ignoring it
+    // gets the bot temporarily throttled rather than just dropping one message.
     if (retryOn429 && err.response?.status === 429) {
       const wait = (body?.parameters?.retry_after || 1) * 1000;
       console.warn(`⏳ Telegram rate limited, retrying in ${wait}ms`);
       await sleep(wait + 250);
-      return callApi(method, payload, { retryOn429: false });
+      return callApi(method, payload, { retryOn429: false, timeout });
     }
 
     throw new Error(body?.description || err.message);
@@ -254,210 +110,205 @@ async function callApi(method, payload, { retryOn429 = true } = {}) {
 }
 
 /**
- * Send a message to the configured recipients.
- *
- * @param {string} text        HTML-formatted body (escape user content first).
- * @param {object} [opts]
- * @param {Array}  [opts.chatIds]  Targets from parseChatTargets(). Filtered
- *                                 against the allowlist regardless. Defaults to
- *                                 TELEGRAM_CHAT_ID.
- * @param {Array}  [opts.buttons]  Inline keyboard rows.
- * @returns {Promise<Array>} one entry per chat: { chatId, ok, error? }
+ * Send to one specific chat.
  */
-async function sendTelegram(text, { chatIds, buttons, disablePreview = true } = {}) {
-  if (!TOKEN) {
-    console.warn("📵 Telegram not configured (TELEGRAM_BOT_TOKEN missing) — skipping alert.");
-    return [];
-  }
-
-  const targets = resolveTargets(chatIds);
-  if (!targets.length) {
-    console.warn("📵 Telegram has no allowed recipient — set TELEGRAM_CHAT_ID. Skipping alert.");
-    return [];
-  }
-
+async function sendToChat(chatId, text, buttons) {
   const parts = chunkText(text);
-  const results = [];
-
-  for (const target of targets) {
-    try {
-      for (let i = 0; i < parts.length; i++) {
-        const payload = {
-          chat_id: target.chatId,
-          text: parts[i],
-          parse_mode: "HTML",
-          disable_web_page_preview: disablePreview,
-        };
-        if (target.threadId) payload.message_thread_id = target.threadId;
-        // Buttons belong on the LAST chunk, next to the full context.
-        if (buttons && buttons.length && i === parts.length - 1) {
-          payload.reply_markup = { inline_keyboard: buttons };
-        }
-        await callApi("sendMessage", payload);
-      }
-      results.push({ chatId: target.chatId, label: target.label, ok: true });
-    } catch (err) {
-      const reason = explainError(err.message, target.chatId);
-      console.error(`❌ Telegram send to ${target.label || target.chatId} failed: ${reason}`);
-      results.push({ chatId: target.chatId, label: target.label, ok: false, error: reason });
+  for (let i = 0; i < parts.length; i++) {
+    const payload = {
+      chat_id: chatId,
+      text: parts[i],
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    };
+    // Buttons belong on the LAST chunk, next to the full context.
+    if (buttons && buttons.length && i === parts.length - 1) {
+      payload.reply_markup = { inline_keyboard: buttons };
     }
+    await callApi("sendMessage", payload);
   }
-
-  return results;
 }
 
 /**
- * Reply into a chat that just sent us a command. Goes through the same
- * allowlist as everything else, with one carve-out: /myid, which must answer
- * someone who is not yet listed (that is how they get their id).
+ * Broadcast to every active subscriber. This is the only way alerts go out, so
+ * "who gets notified" has exactly one answer: whoever pressed /start and was
+ * approved.
  */
-async function replyToChat(chatId, threadId, text, buttons, { bypassAllowlist = false } = {}) {
-  if (bypassAllowlist && !isAllowedChat(chatId)) {
-    if (!TOKEN) return [];
-    try {
-      const payload = {
-        chat_id: chatId,
-        text: chunkText(text)[0],
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      };
-      if (threadId) payload.message_thread_id = threadId;
-      await callApi("sendMessage", payload);
-      return [{ chatId, ok: true }];
-    } catch (err) {
-      console.warn(`⚠️  Telegram id-lookup reply to ${chatId} failed:`, err.message);
-      return [{ chatId, ok: false, error: err.message }];
-    }
+async function broadcast(text, { buttons } = {}) {
+  if (!TOKEN) {
+    console.warn("📵 TELEGRAM_BOT_TOKEN not set — skipping notification.");
+    return [];
   }
 
-  return sendTelegram(text, { chatIds: [{ chatId, threadId: threadId || null }], buttons });
+  let subscribers;
+  try {
+    subscribers = await TelegramSubscriber.find({ active: true });
+  } catch (err) {
+    console.error("❌ Could not load Telegram subscribers:", err.message);
+    return [];
+  }
+
+  // Second gate: the env allowlist wins over whatever is in the database.
+  const before = subscribers.length;
+  subscribers = subscribers.filter((s) => access.isAllowedNumber(s.phoneNumber));
+  if (before !== subscribers.length) {
+    console.warn(
+      `🔒 ${before - subscribers.length} subscriber(s) skipped — no longer in TELEGRAM_ALLOWED_NUMBERS.`
+    );
+  }
+
+  if (!subscribers.length) {
+    console.warn(
+      "📭 No verified subscribers — an allowed number needs to press /start on the bot."
+    );
+    return [];
+  }
+
+  const results = [];
+  for (const sub of subscribers) {
+    try {
+      await sendToChat(sub.chatId, text, buttons);
+      results.push({ chatId: sub.chatId, name: sub.firstName, ok: true });
+    } catch (err) {
+      const reason = explainError(err.message, sub.chatId);
+      console.error(`❌ Telegram to ${sub.firstName || sub.chatId} failed: ${reason}`);
+
+      // A blocked or deleted chat never recovers on its own. Deactivating it
+      // stops every future broadcast retrying a dead address forever.
+      if (/blocked by the user|chat not found/i.test(err.message)) {
+        await TelegramSubscriber.updateOne({ chatId: sub.chatId }, { $set: { active: false } });
+      }
+      results.push({ chatId: sub.chatId, name: sub.firstName, ok: false, error: reason });
+    }
+    await sleep(120);
+  }
+  return results;
 }
 
-// Acknowledge a button tap so the client stops showing its spinner. Telegram
-// requires this within ~10s; a missed ack leaves the button looking hung.
-async function answerCallback(callbackQueryId, text = "", showAlert = false) {
+// Acknowledge a button tap so the client stops spinning. Telegram wants this
+// within ~10s; a missed ack leaves the button looking hung.
+async function answerCallback(callbackQueryId, text = "") {
   if (!TOKEN || !callbackQueryId) return;
   try {
     await callApi("answerCallbackQuery", {
       callback_query_id: callbackQueryId,
       text: text.slice(0, 200),
-      show_alert: showAlert,
     });
   } catch (err) {
     console.warn("⚠️  answerCallbackQuery failed:", err.message);
   }
 }
 
-/**
- * Check every configured recipient is actually reachable, at boot. This turns
- * the most common setup mistakes — a wrong id, a bot not added to the group, a
- * teammate who never pressed /start — into a startup warning instead of an
- * alert that quietly never arrives.
- */
-async function verifyRecipients() {
-  if (!isConfigured()) return [];
+// ---------------------------------------------------------------------------
+// Long polling
+//
+// A 30-second long poll: Telegram holds the request open until an update
+// arrives, so this is one idle HTTP connection, not a busy loop.
+// ---------------------------------------------------------------------------
+let pollingStopped = false;
 
-  const seen = new Map();
-  for (const t of [...RECIPIENTS, ...STUCK_RECIPIENTS]) {
-    if (!seen.has(String(t.chatId))) seen.set(String(t.chatId), t);
+// Diagnostics. Whether Telegram is reaching us at all is the first thing to
+// know when "I pressed /start and nothing happened" — it splits the problem
+// cleanly into "the bot never heard you" vs "it heard you and refused you".
+const diag = {
+  polling: false,
+  botUsername: null,
+  updatesReceived: 0,
+  lastUpdateAt: null,
+  lastUpdateFrom: null,
+  lastError: null,
+  startedAt: null,
+};
+
+async function startPolling(handleUpdate) {
+  if (!TOKEN) {
+    console.log("📵 Telegram off — set TELEGRAM_BOT_TOKEN to enable it.");
+    return;
   }
 
-  const report = [];
-  for (const target of seen.values()) {
-    try {
-      const chat = await callApi("getChat", { chat_id: target.chatId });
-      const name = chat.title || [chat.first_name, chat.last_name].filter(Boolean).join(" ") || chat.username;
-      console.log(`   ✅ ${target.chatId} — ${name || "(unnamed)"} [${chat.type}]`);
-      report.push({ chatId: target.chatId, ok: true, name, type: chat.type });
-    } catch (err) {
-      const reason = explainError(err.message, target.chatId);
-      console.warn(`   ⚠️  ${target.chatId} — ${reason}`);
-      report.push({ chatId: target.chatId, ok: false, error: reason });
-    }
-  }
-  return report;
-}
-
-/**
- * Point Telegram at our /webhook/telegram route. Safe to call on every boot —
- * setWebhook is idempotent.
- */
-async function setWebhook(publicBaseUrl) {
-  if (!TOKEN || !publicBaseUrl) return null;
-  const url = `${publicBaseUrl.replace(/\/+$/, "")}/webhook/telegram`;
+  // Clear any webhook from a previous deploy; Telegram refuses getUpdates
+  // while one is registered.
   try {
-    await callApi("setWebhook", {
-      url,
-      secret_token: WEBHOOK_SECRET || undefined,
-      allowed_updates: ["message", "callback_query"],
-      drop_pending_updates: true,
-    });
-    console.log(`🤖 Telegram webhook registered at ${url}`);
-    return url;
+    await callApi("deleteWebhook", { drop_pending_updates: false });
+  } catch (_) {}
+
+  let me = null;
+  try {
+    me = await callApi("getMe", {});
+    diag.botUsername = me.username;
+    diag.polling = true;
+    diag.startedAt = new Date();
+    console.log(`🤖 Telegram bot @${me.username} is listening. Press /start in Telegram.`);
   } catch (err) {
-    console.error("❌ Telegram setWebhook failed:", err.message);
-    return null;
+    diag.lastError = err.message;
+    console.error("❌ Telegram token rejected:", err.message);
+    console.error("   Check TELEGRAM_BOT_TOKEN in .env — copy it whole from @BotFather.");
+    return;
   }
+
+  let offset = 0;
+  let backoff = 1000;
+
+  (async function loop() {
+    while (!pollingStopped) {
+      try {
+        const updates = await callApi(
+          "getUpdates",
+          { offset, timeout: 30, allowed_updates: ["message", "callback_query"] },
+          { timeout: 40000, retryOn429: true }
+        );
+
+        backoff = 1000; // healthy again
+
+        for (const update of updates || []) {
+          offset = update.update_id + 1;
+
+          diag.updatesReceived++;
+          diag.lastUpdateAt = new Date();
+          const msg = update.message || update.callback_query?.message;
+          diag.lastUpdateFrom = String(msg?.chat?.id || "unknown");
+          // Logged unconditionally: without it, a rejected /start is invisible
+          // and indistinguishable from the bot never receiving anything.
+          console.log(
+            `📥 Telegram update from chat ${diag.lastUpdateFrom}` +
+              (update.message?.text ? `: ${update.message.text}` : "") +
+              (update.message?.contact ? " [shared contact]" : "")
+          );
+          // Never let one bad update stop the loop — the bot going deaf is a
+          // far worse failure than one dropped command.
+          handleUpdate(update).catch((err) =>
+            console.error("❌ Telegram update failed:", err.message)
+          );
+        }
+      } catch (err) {
+        diag.lastError = err.message;
+        console.error("⚠️  Telegram polling error:", err.message);
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, 60000); // ease off a struggling network
+      }
+    }
+  })();
+
+  return me;
 }
 
-// Check the header Telegram echoes back on every update. Without this, anyone
-// who guesses the route can post fake commands.
-function verifyWebhookRequest(req) {
-  if (!WEBHOOK_SECRET) return true; // not configured — accept (dev / local)
-  return req.get("X-Telegram-Bot-Api-Secret-Token") === WEBHOOK_SECRET;
+function stopPolling() {
+  pollingStopped = true;
+  diag.polling = false;
 }
 
-// A readable summary of who is configured, for logs and the debug endpoint.
-function describeRecipients() {
-  return {
-    configured: isConfigured(),
-    alertRecipients: RECIPIENTS.map((t) => ({
-      chatId: t.chatId,
-      label: t.label,
-      threadId: t.threadId,
-    })),
-    stuckRecipients: STUCK_RECIPIENTS.map((t) => ({
-      chatId: t.chatId,
-      label: t.label,
-      threadId: t.threadId,
-    })),
-    canRunCommands: [...COMMAND_IDS],
-    mirrorWhatsAppAlerts: MIRROR_ALERTS,
-    idLookupOpen: ALLOW_ID_LOOKUP,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Mirror of the existing WhatsApp team alerts.
-// Fire-and-forget: a Telegram outage must never block or fail a WhatsApp alert.
-// ---------------------------------------------------------------------------
-function mirrorAlert(title, body, { buttons } = {}) {
-  if (!MIRROR_ALERTS || !isConfigured()) return;
-  const text = `<b>${escapeHtml(title)}</b>\n\n${escapeHtml(body)}`;
-  sendTelegram(text, { buttons }).catch((err) =>
-    console.warn("⚠️  Telegram mirror failed:", err.message)
-  );
-}
+const getDiagnostics = () => ({ ...diag });
 
 module.exports = {
   isConfigured,
-  sendTelegram,
-  replyToChat,
+  broadcast,
+  sendToChat,
   answerCallback,
-  setWebhook,
-  verifyWebhookRequest,
-  verifyRecipients,
-  describeRecipients,
-  isAllowedChat,
-  isAllowedCommandChat,
-  resolveTargets,
-  mirrorAlert,
+  startPolling,
+  stopPolling,
+  getDiagnostics,
   escapeHtml,
   chunkText,
-  parseChatTargets,
   explainError,
-  RECIPIENTS,
-  STUCK_RECIPIENTS,
-  MIRROR_ALERTS,
-  ALLOW_ID_LOOKUP,
+  callApi,
 };
