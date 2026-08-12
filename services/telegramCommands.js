@@ -29,6 +29,17 @@ const telegram = require("./telegram");
 const access = require("./telegramAccess");
 const stuckLeads = require("./stuckLeads");
 
+// Telegram's "Share my number" button (request_contact) is only implemented in
+// the mobile apps — on Telegram Desktop it silently does not render. This flag
+// lets a desktop-only user TYPE their number instead.
+//
+// It is weaker: a typed number is a claim, not proof, so anyone who knows one of
+// the allowed numbers could subscribe with it. The bot token is secret, so that
+// means someone who already has the token — but it is a real downgrade, which is
+// why it is off unless you turn it on.
+const ALLOW_TYPED_NUMBER =
+  String(process.env.TELEGRAM_ALLOW_TYPED_NUMBER || "false").toLowerCase() === "true";
+
 const e = telegram.escapeHtml;
 
 const HELP = [
@@ -90,7 +101,10 @@ async function askForNumber(chatId) {
     chat_id: chatId,
     text:
       "👋 To use this bot, tap the button below to confirm your number.\n\n" +
-      "Only approved numbers can access lead data.",
+      "Only approved numbers can access lead data." +
+      (ALLOW_TYPED_NUMBER
+        ? "\n\n💻 No button? You're on Telegram Desktop, which doesn't support it. Just type your number instead, e.g. +447700900123"
+        : "\n\n💻 No button? Telegram Desktop doesn't support this — open the bot on your phone once, and Desktop will work afterwards."),
     reply_markup: {
       keyboard: [[{ text: "📱 Share my number", request_contact: true }]],
       resize_keyboard: true,
@@ -112,6 +126,37 @@ async function handleContact(message) {
     console.warn(`🚫 Telegram contact rejected from chat ${chatId}: ${check.reason}`);
     return;
   }
+
+  return grantAccess(message, check.number, "shared-contact");
+}
+
+/**
+ * Desktop fallback: the user typed a number rather than sharing a contact.
+ * Only reachable when TELEGRAM_ALLOW_TYPED_NUMBER=true.
+ */
+async function handleTypedNumber(message) {
+  const chatId = String(message.chat.id);
+
+  // resolveTypedNumber also matches a number typed without its country code,
+  // which is what people naturally do.
+  const number = access.resolveTypedNumber(message.text);
+
+  if (!number) {
+    console.warn(
+      `🚫 Telegram: typed number from chat ${chatId} is not in TELEGRAM_ALLOWED_NUMBERS`
+    );
+    return;
+  }
+  return grantAccess(message, number, "typed");
+}
+
+/**
+ * Check a number against the allowlist and subscribe on success.
+ * Shared by both routes so the allowlist decision lives in exactly one place.
+ */
+async function grantAccess(message, number, method) {
+  const chatId = String(message.chat.id);
+  const check = { number };
 
   if (!access.isAllowedNumber(check.number)) {
     console.warn(
@@ -138,7 +183,7 @@ async function handleContact(message) {
   console.log(
     `✅ Telegram access granted to ${access.displayNumber(check.number)} (${
       message.from?.first_name || chatId
-    })`
+    }) via ${method}`
   );
 
   // Drop the share-number keyboard now that it has served its purpose.
@@ -268,7 +313,15 @@ async function handleMessage(message) {
   if (message.contact) return handleContact(message);
 
   const text = (message.text || "").trim();
-  if (!text.startsWith("/")) return;
+
+  // Not a command. The only non-command text the bot acts on is a typed phone
+  // number from someone not yet subscribed, and only if that fallback is on.
+  if (!text.startsWith("/")) {
+    if (!ALLOW_TYPED_NUMBER) return;
+    if (await activeSubscriber(chatId)) return; // already in, nothing to do
+    if (!/[\d]{6,}/.test(text)) return; // not number-shaped, ignore silently
+    return handleTypedNumber(message);
+  }
 
   const [rawCmd, ...args] = text.split(/\s+/);
   const cmd = rawCmd.split("@")[0].toLowerCase();
@@ -337,6 +390,8 @@ async function handleMessage(message) {
 module.exports = {
   handleUpdate,
   handleContact,
+  handleTypedNumber,
+  grantAccess,
   askForNumber,
   activeSubscriber,
   unsubscribe,

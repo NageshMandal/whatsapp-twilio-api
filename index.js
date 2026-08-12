@@ -892,7 +892,7 @@ app.get("/telegram/status", async (_req, res) => {
     if (dbError) problems.push(`Database unreachable: ${dbError}`);
     if (!process.env.TELEGRAM_BOT_TOKEN) problems.push("TELEGRAM_BOT_TOKEN is not set in .env");
     if (!telegramAccess.hasAllowlist())
-      problems.push("TELEGRAM_ALLOWED_NUMBERS is empty — nobody can use the bot");
+      problems.push("TELEGRAM_ALLOWED_USERS is empty — nobody can use the bot");
     if (!diag.polling)
       problems.push("The bot is not polling — the token was rejected, or the app needs a restart");
     if (diag.polling && diag.updatesReceived === 0)
@@ -901,7 +901,7 @@ app.get("/telegram/status", async (_req, res) => {
       );
     if (diag.updatesReceived > 0 && subs.length === 0 && !dbError)
       problems.push(
-        "Messages ARE arriving but nobody is verified — the number that pressed /start is not in TELEGRAM_ALLOWED_NUMBERS. Compare it with allowedNumbers below"
+        "Messages ARE arriving but nobody is subscribed — the account that pressed /start is not in TELEGRAM_ALLOWED_USERS. The server log shows its @username and id"
       );
 
     res.json({
@@ -913,13 +913,14 @@ app.get("/telegram/status", async (_req, res) => {
       lastUpdateAt: diag.lastUpdateAt,
       lastUpdateFromChat: diag.lastUpdateFrom,
       lastError: diag.lastError,
-      allowedNumbers: telegramAccess.listAllowed(),
-      verifiedSubscribers: subs.map((s) => ({
+      allowedUsers: telegramAccess.listAllowed(),
+      subscribers: subs.map((s) => ({
         chatId: s.chatId,
-        number: telegramAccess.displayNumber(s.phoneNumber),
+        userId: s.userId,
+        username: s.username ? `@${s.username}` : null,
         name: s.firstName,
         active: s.active,
-        stillAllowed: telegramAccess.isAllowedNumber(s.phoneNumber),
+        stillAllowed: telegramAccess.isAllowedUser({ id: s.userId, username: s.username }),
       })),
       problems,
     });

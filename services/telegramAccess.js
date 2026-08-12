@@ -73,6 +73,36 @@ const isAllowedNumber = (number) => {
 
 const hasAllowlist = () => ALLOWED_NUMBERS.size > 0;
 
+/**
+ * Resolve a number the user TYPED against the allowlist.
+ *
+ * Typing is ambiguous in a way that sharing a contact is not. Someone with an
+ * Indian number who types "7281972289" gets +447281972289 under a UK
+ * DEFAULT_COUNTRY_CODE — the right digits, the wrong country, no match.
+ *
+ * So after the exact check fails, fall back to matching on the national part:
+ * find allowlist entries whose digits END with what was typed. This is only
+ * accepted when it identifies exactly ONE entry — two matches is an ambiguity
+ * we must not guess at, and the 9-digit floor stops a short string like "123"
+ * matching half the list.
+ *
+ * @returns {string|null} the matching allowlist entry, or null.
+ */
+function resolveTypedNumber(raw) {
+  const exact = normaliseNumber(raw);
+  if (exact && ALLOWED_NUMBERS.has(exact)) return exact;
+
+  const digits = String(raw || "").replace(/[^\d]/g, "");
+  if (digits.length < 9) return null;
+
+  const national = digits.replace(/^0+/, "");
+  const matches = [...ALLOWED_NUMBERS].filter(
+    (allowed) => allowed.endsWith(national) || allowed === digits
+  );
+
+  return matches.length === 1 ? matches[0] : null;
+}
+
 const listAllowed = () => [...ALLOWED_NUMBERS].map(displayNumber);
 
 /**
@@ -117,6 +147,7 @@ module.exports = {
   normaliseNumber,
   displayNumber,
   isAllowedNumber,
+  resolveTypedNumber,
   hasAllowlist,
   listAllowed,
   verifyContact,

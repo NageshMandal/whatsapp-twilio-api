@@ -1,30 +1,26 @@
 const mongoose = require("mongoose");
 
 // ---------------------------------------------------------------------------
-// A person who pressed /start AND proved they hold a phone number listed in
-// TELEGRAM_ALLOWED_NUMBERS.
+// A person who pressed /start and is on the TELEGRAM_ALLOWED_USERS list.
 //
-// The row stores the verified number alongside the chat id, because the env
-// allowlist is re-checked on every broadcast. Removing a number from .env and
-// restarting therefore cuts that person off immediately — no stale row keeps
-// sending them customer details.
+// The row exists only to remember WHERE to send (the chat id). It is not the
+// authority on who is allowed — that is the env list, re-checked on every
+// message and every broadcast. So removing someone from .env and restarting
+// cuts them off immediately, with no stale row left forwarding lead data.
 // ---------------------------------------------------------------------------
 const telegramSubscriberSchema = new mongoose.Schema(
   {
     chatId: { type: String, required: true, unique: true, index: true },
 
-    // Bare international digits, e.g. "447700900123". Compared against the
-    // allowlist, which is normalised the same way.
-    phoneNumber: { type: String, required: true, index: true },
+    // Telegram's permanent id for the account. Never changes, never reused —
+    // the reliable identifier when a username has been changed.
+    userId: { type: String, default: null, index: true },
 
-    firstName: { type: String, default: null },
     username: { type: String, default: null },
+    firstName: { type: String, default: null },
 
-    // /stop sets this false without deleting the row, so /start turns it back
-    // on without re-verifying the number.
+    // /stop sets this false without deleting the row.
     active: { type: Boolean, default: true },
-
-    verifiedAt: { type: Date, default: Date.now },
   },
   { timestamps: true }
 );

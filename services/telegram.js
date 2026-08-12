@@ -18,13 +18,13 @@
 //   is set the webhook route still works, but nothing requires it.
 //
 // WHO RECEIVES ALERTS
-//   Only the phone numbers in TELEGRAM_ALLOWED_NUMBERS. A person presses
-//   /start, shares their number through Telegram's own verified button, and is
-//   subscribed if it matches. Everyone else gets silence.
+//   Only the accounts in TELEGRAM_ALLOWED_USERS. Telegram identifies the sender
+//   on every message, so a person just presses /start — nothing to type, nothing
+//   to verify. Everyone else gets silence.
 //
-//   The allowlist is re-checked on every broadcast, not just at signup — so
-//   deleting a number from .env and restarting cuts that person off on the
-//   spot, with no stale database row left quietly forwarding customer details.
+//   The allowlist is re-checked on every broadcast, not just at /start — so
+//   removing someone from .env and restarting cuts them off on the spot, with no
+//   stale database row left quietly forwarding customer details.
 // ---------------------------------------------------------------------------
 
 const axios = require("axios");
@@ -150,17 +150,17 @@ async function broadcast(text, { buttons } = {}) {
 
   // Second gate: the env allowlist wins over whatever is in the database.
   const before = subscribers.length;
-  subscribers = subscribers.filter((s) => access.isAllowedNumber(s.phoneNumber));
+  subscribers = subscribers.filter((s) =>
+    access.isAllowedUser({ id: s.userId, username: s.username })
+  );
   if (before !== subscribers.length) {
     console.warn(
-      `🔒 ${before - subscribers.length} subscriber(s) skipped — no longer in TELEGRAM_ALLOWED_NUMBERS.`
+      `🔒 ${before - subscribers.length} subscriber(s) skipped — no longer in TELEGRAM_ALLOWED_USERS.`
     );
   }
 
   if (!subscribers.length) {
-    console.warn(
-      "📭 No verified subscribers — an allowed number needs to press /start on the bot."
-    );
+    console.warn("📭 No subscribers — an allowed user needs to press /start on the bot.");
     return [];
   }
 
@@ -168,17 +168,17 @@ async function broadcast(text, { buttons } = {}) {
   for (const sub of subscribers) {
     try {
       await sendToChat(sub.chatId, text, buttons);
-      results.push({ chatId: sub.chatId, name: sub.firstName, ok: true });
+      results.push({ chatId: sub.chatId, name: sub.username || sub.firstName, ok: true });
     } catch (err) {
       const reason = explainError(err.message, sub.chatId);
-      console.error(`❌ Telegram to ${sub.firstName || sub.chatId} failed: ${reason}`);
+      console.error(`❌ Telegram to ${sub.username || sub.firstName || sub.chatId} failed: ${reason}`);
 
       // A blocked or deleted chat never recovers on its own. Deactivating it
       // stops every future broadcast retrying a dead address forever.
       if (/blocked by the user|chat not found/i.test(err.message)) {
         await TelegramSubscriber.updateOne({ chatId: sub.chatId }, { $set: { active: false } });
       }
-      results.push({ chatId: sub.chatId, name: sub.firstName, ok: false, error: reason });
+      results.push({ chatId: sub.chatId, name: sub.username || sub.firstName, ok: false, error: reason });
     }
     await sleep(120);
   }
