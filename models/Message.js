@@ -99,6 +99,17 @@ const messageSchema = new mongoose.Schema(
     lastInboundAt: { type: Date, default: null },
     lastOutboundAt: { type: Date, default: null },
 
+    // --- stuck-lead alert bookkeeping ---
+    // These MUST be in the schema: Mongoose strict mode silently drops $set on
+    // unknown fields, which is exactly why the same leads were re-alerted every
+    // day — stuckNotified was never actually saved.
+    // true once this lead has appeared in a Telegram alert; cleared on every
+    // inbound message so a lead that revives and goes quiet again alerts again.
+    stuckNotified: { type: Boolean, default: false },
+    stuckNotifiedAt: { type: Date, default: null },
+    // set by the 😴 snooze button / command; the lead is hidden until then.
+    stuckSnoozedUntil: { type: Date, default: null },
+
     messages: [subMessageSchema],
   },
   { timestamps: true }

@@ -33,7 +33,7 @@ const e = telegram.escapeHtml;
 const HELP = [
   "<b>What I do</b>",
   "",
-  "Once a day I send you every lead that has gone quiet for 24h+ and never qualified.",
+  "Once a day I send you leads that have gone quiet for 24h+ and never qualified. Each lead is sent ONCE — you only hear about it again if it replies and then goes quiet a second time. /stuck shows the full current list any time.",
   "",
   "<b>Commands</b>",
   "/stuck — show them right now",
@@ -233,15 +233,20 @@ async function handleMessage(message) {
     case "/who":
       return telegram.sendToChat(chatId, await whoHasAccess());
 
+    // Manual check: show the FULL current list, including leads already
+    // alerted. Only the automatic daily message is new-leads-only.
     case "/stuck": {
-      const digest = await stuckLeads.buildStuckDigest();
+      const digest = await stuckLeads.buildStuckDigest({ includeNotified: true });
       return telegram.sendToChat(chatId, digest.text, digest.buttons);
     }
 
     // Ignores STUCK_LEAD_MAX_AGE_DAYS. The daily message caps age so a fresh
     // deploy doesn't dump years of dead leads on you; this asks for all of it.
     case "/backlog": {
-      const digest = await stuckLeads.buildStuckDigest({ maxAgeMs: Infinity });
+      const digest = await stuckLeads.buildStuckDigest({
+        maxAgeMs: Infinity,
+        includeNotified: true,
+      });
       return telegram.sendToChat(chatId, digest.text, digest.buttons);
     }
 

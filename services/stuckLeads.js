@@ -27,9 +27,10 @@
 // second silence is a different, later problem.
 //
 // DELIVERY: one message a day, to whoever pressed /start on the bot. Not one
-// ping per lead — a list. A lead stays on the list every day until someone
-// takes it over, snoozes it, or it ages past STUCK_LEAD_MAX_AGE_DAYS, so a
-// missed day costs nothing.
+// ping per lead — a list. Each lead is alerted ONCE: after a successful send
+// it is marked stuckNotified and drops off future daily messages. The daily
+// message therefore only contains NEW stuck leads; if nothing new got stuck,
+// nothing is sent. /stuck and /backlog still show the FULL list on demand.
 //
 // .env (all optional; defaults are fine)
 //   STUCK_LEAD_DAILY_TIME=09:00         when the daily list is sent
@@ -287,59 +288,73 @@ async function findStuckLeads({
  * Deliberately NOT one alert per lead. Ten separate pings at 9am is noise
  * people learn to swipe away; one list is something you read.
  */
-async function buildStuckDigest({ now = Date.now(), maxAgeMs = MAX_AGE_MS } = {}) {
-  const stuck = await findStuckLeads({ includeNotified: true, now, maxAgeMs });
+const DIVIDER = "─".repeat(18);
+
+async function buildStuckDigest({
+  now = Date.now(),
+  maxAgeMs = MAX_AGE_MS,
+  // false (the daily default): only leads never alerted before, so nobody
+  // sees the same lead twice. true: the full list, for /stuck and /backlog.
+  includeNotified = false,
+} = {}) {
+  const stuck = await findStuckLeads({ includeNotified, now, maxAgeMs });
 
   if (!stuck.length) {
     return {
       empty: true,
-      text: "✅ <b>No stuck leads.</b> Everything is either moving or already with a human.",
+      text: includeNotified
+        ? "✅ <b>No stuck leads.</b> Everything is either moving or already with a human."
+        : "✅ <b>No new stuck leads.</b> Nothing new has gone quiet since the last alert.",
       leads: [],
       buttons: [],
     };
   }
 
+  const plural = stuck.length === 1 ? "" : "s";
   const lines = [
-    `🚨 <b>${stuck.length} stuck lead${stuck.length === 1 ? "" : "s"}</b>`,
-    `<i>No reply for ${Math.round(STUCK_AFTER_MS / HOUR)}h+, never qualified.</i>`,
-    "",
+    includeNotified
+      ? `🚨 <b>${stuck.length} stuck lead${plural}</b> <i>(full list)</i>`
+      : `🚨 <b>${stuck.length} new stuck lead${plural}</b>`,
+    `<i>No reply for ${Math.round(STUCK_AFTER_MS / HOUR)}h+, never qualified. Sent once — you won't see these again.</i>`,
   ];
 
-  for (const f of stuck.slice(0, 40)) {
+  stuck.slice(0, 40).forEach((f, i) => {
     const stage = stageOf(f.step);
     const waLink = `https://wa.me/${f.phoneNumber.replace(/[^\d]/g, "")}`;
     const name = f.customerName || "No name captured";
 
     lines.push(
-      `<b>${e(name)}</b> — <a href="${waLink}">${e(f.phoneNumber)}</a>`,
-      `   📍 <b>Stage ${stage.order} of ${TOTAL_STAGES}</b> · ${e(stage.label)}`,
-      `   ⛔ ${e(
+      DIVIDER,
+      `<b>${i + 1}. ${e(name)}</b>`,
+      // <code> makes the number tap-to-copy in Telegram; the link opens the chat.
+      `📞 <code>${e(f.phoneNumber)}</code> · <a href="${waLink}">Open WhatsApp</a>`,
+      `📍 Stage <b>${stage.order}/${TOTAL_STAGES}</b> — ${e(stage.label)}`,
+      `⛔ ${e(
         f.reason === "never_replied"
           ? "never replied to a single message"
           : stage.stuck
       )}`,
-      `   ⏱ quiet ${e(formatDuration(f.silentMs))} · ${f.followUpCount}/5 nudges${
-        f.windowClosed ? " · ⚠️ WhatsApp shut, call them" : ""
-      }`,
-      ""
+      `⏱ Quiet <b>${e(formatDuration(f.silentMs))}</b> · ${f.followUpCount}/5 nudges` +
+        (f.windowClosed ? `\n☎️ WhatsApp window shut — <b>call them</b>` : "")
     );
-  }
+  });
 
-  if (stuck.length > 40) lines.push(`<i>…and ${stuck.length - 40} more.</i>`, "");
+  lines.push(DIVIDER);
+  if (stuck.length > 40) lines.push(`<i>…and ${stuck.length - 40} more.</i>`);
 
   // Be explicit when the buttons don't cover the whole list, otherwise it reads
-  // as leads silently missing their button.
+  // as leads silently missing their buttons.
   lines.push(
     stuck.length > 10
-      ? `<i>📋 buttons cover the first 10. /takeover +447... to handle one yourself.</i>`
-      : "<i>Tap 📋 to copy a lead. /takeover +447... to handle one yourself.</i>"
+      ? `<i>Buttons cover the first 10 leads. /takeover +447… to handle one yourself.</i>`
+      : `<i>📋 copies the lead · 🙋 you take it over · 😴 hides it for 24h.</i>`
   );
 
   return {
     empty: false,
     text: lines.join("\n"),
     leads: stuck,
-    buttons: buildCopyButtons(stuck),
+    buttons: buildLeadButtons(stuck),
   };
 }
 
@@ -352,7 +367,7 @@ async function buildStuckDigest({ now = Date.now(), maxAgeMs = MAX_AGE_MS } = {}
  * keyboard buries the message itself, so the buttons cover the first ten leads
  * and the rest are reachable via the list above.
  */
-function buildCopyButtons(leads, max = 10) {
+function buildLeadButtons(leads, max = 10) {
   return leads.slice(0, max).map((f) => {
     const stage = stageOf(f.step);
     const name = f.customerName || "No name captured";
@@ -369,14 +384,37 @@ function buildCopyButtons(leads, max = 10) {
       }`,
     ].join("\n");
 
+    // One row per lead: copy the details, take it over, or snooze it — the
+    // last two go straight to the existing callback handlers in
+    // telegramCommands.js ("takeover:<phone>" / "snooze:<phone>").
     return [
       {
         // Button labels are capped too, and a wrapped label looks broken.
-        text: `📋 ${name.slice(0, 24)}`,
+        text: `📋 ${name.slice(0, 16)}`,
         copy_text: { text: payload.slice(0, 256) },
       },
+      { text: "🙋 Take", callback_data: `takeover:${f.phoneNumber}`.slice(0, 64) },
+      { text: "😴 24h", callback_data: `snooze:${f.phoneNumber}`.slice(0, 64) },
     ];
   });
+}
+
+// Kept for anything still importing the old name.
+const buildCopyButtons = buildLeadButtons;
+
+/**
+ * Flag leads as alerted so tomorrow's message doesn't repeat them. Called only
+ * AFTER at least one subscriber actually received the message — if delivery
+ * fails, the leads stay eligible and go out next run instead of being lost.
+ */
+async function markLeadsNotified(leads, when = new Date()) {
+  const phones = (leads || []).map((l) => l.phoneNumber).filter(Boolean);
+  if (!phones.length) return 0;
+  const res = await Message.updateMany(
+    { phoneNumber: { $in: phones } },
+    { $set: { stuckNotified: true, stuckNotifiedAt: when } }
+  );
+  return res.modifiedCount || 0;
 }
 
 
@@ -392,24 +430,37 @@ async function sendDailyDigest({ force = false, maxAgeMs = MAX_AGE_MS } = {}) {
 
   let digest;
   try {
-    digest = await buildStuckDigest({ maxAgeMs });
+    // Only leads that have never been alerted — no repeats.
+    digest = await buildStuckDigest({ maxAgeMs, includeNotified: false });
   } catch (err) {
     console.error("❌ Stuck-lead digest failed:", err.message);
     return { error: err.message, sent: 0 };
   }
 
-  // Nothing to report: stay quiet rather than sending "all clear" every
+  // Nothing NEW to report: stay quiet rather than sending "all clear" every
   // morning, which is how a daily notification becomes background noise.
   if (digest.empty && !force) {
-    console.log("✅ Daily stuck-lead check: nothing to report.");
+    console.log("✅ Daily stuck-lead check: no new stuck leads.");
     return { sent: 0, leads: 0 };
   }
 
   const results = await telegram.broadcast(digest.text, { buttons: digest.buttons });
   const delivered = results.filter((r) => r.ok).length;
 
+  // Only mark them once someone has actually seen the alert. If every send
+  // failed (or nobody has pressed /start yet), the leads remain eligible and
+  // will go out on the next run instead of vanishing unseen.
+  if (delivered > 0 && digest.leads.length) {
+    try {
+      const flagged = await markLeadsNotified(digest.leads);
+      console.log(`🏷️  Marked ${flagged} lead(s) as notified — they won't repeat.`);
+    } catch (err) {
+      console.error("⚠️  Could not mark leads as notified:", err.message);
+    }
+  }
+
   console.log(
-    `📨 Daily stuck-lead list: ${digest.leads.length} lead(s) to ${delivered} subscriber(s).`
+    `📨 Stuck-lead alert: ${digest.leads.length} new lead(s) to ${delivered} subscriber(s).`
   );
 
   return { sent: delivered, leads: digest.leads.length };
@@ -455,7 +506,9 @@ module.exports = {
   buildStuckDigest,
   evaluateLead,
   formatDuration,
+  buildLeadButtons,
   buildCopyButtons,
+  markLeadsNotified,
   stageOf,
   STAGES,
   TOTAL_STAGES,
