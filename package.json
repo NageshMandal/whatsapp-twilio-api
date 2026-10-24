@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",
@@ -22,6 +22,7 @@
     "twilio": "^6.0.2"
   },
   "devDependencies": {
+    "mongodb-memory-server-core": "^11.3.0",
     "nodemon": "^3.1.14"
   }
 }

@@ -46,6 +46,13 @@ const subMessageSchema = new mongoose.Schema(
     stepAtSend: { type: String, default: null },
     isBot: { type: Boolean, default: false },
     timestamp: { type: Date, default: Date.now },
+    // A message a person sent from the CRM: who, and what Twilio said about it.
+    // (Bot and Telegram messages leave these empty.)
+    sentByName: { type: String, default: undefined },
+    sentVia: { type: String, default: undefined },      // "crm"
+    sid: { type: String, default: undefined },          // Twilio message SID
+    deliveryStatus: { type: String, default: undefined }, // "failed" | "undelivered"
+    deliveryError: { type: String, default: undefined },
   },
   { _id: true }
 );
@@ -109,6 +116,38 @@ const messageSchema = new mongoose.Schema(
     stuckNotifiedAt: { type: Date, default: null },
     // set by the 😴 snooze button / command; the lead is hidden until then.
     stuckSnoozedUntil: { type: Date, default: null },
+
+    // --- the CRM's view of this lead (services/crmBridge.js) ---
+    // The bot flagged a question it could not handle. `active` until someone
+    // resolves it in the CRM (or replies from the CRM). Every flag is kept in
+    // `escalations`, newest last, so the history survives a resolve.
+    escalation: {
+      active: { type: Boolean, default: false },
+      note: { type: String, default: null },
+      question: { type: String, default: null },
+      at: { type: Date, default: null },
+      resolvedAt: { type: Date, default: null },
+      resolvedByName: { type: String, default: null },
+      resolution: { type: String, default: null },
+    },
+    escalations: [
+      {
+        note: String,
+        question: String,
+        at: Date,
+        _id: false,
+      },
+    ],
+    // Whether the stuck-lead rules (services/stuckLeads.js#evaluateLead) say this
+    // lead is stuck right now, refreshed by the CRM bridge's sweep and cleared
+    // on every inbound message. null = not stuck.
+    stuck: { type: mongoose.Schema.Types.Mixed, default: null },
+    // Who took the lead over from the CRM (Telegram /takeover leaves it empty).
+    humanOwner: {
+      name: { type: String, default: null },
+      userId: { type: String, default: null },
+      at: { type: Date, default: null },
+    },
 
     messages: [subMessageSchema],
   },

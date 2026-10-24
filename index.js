@@ -19,6 +19,7 @@ const { isAuthorizedSubmitter, parseLeadSubmission } = require("./services/leadI
 const SourcingRequest = require("./models/SourcingRequest");
 const { looksLikeCarBrief, parseBrief, summariseBrief, startScrape } = require("./services/carSourcing");
 const senders = require("./services/senders");
+const crmBridge = require("./services/crmBridge");
 const app = express();
 
 mongoose.connect(process.env.MONGODB_URI)
@@ -336,6 +337,28 @@ app.get("/", (req, res) => {
   res.json({ success: true, message: "Twilio WhatsApp API is running 🚀" });
 });
 
+// ---------------------------------------------------------------------------
+// The admin routes below (/messages, /send-whatsapp, /stuck-leads,
+// /leads-to-message, /sourcing-requests, /senders, /telegram/status) return or
+// change customer data. With ADMIN_API_KEY set they need the header
+// `x-api-key: <ADMIN_API_KEY>`; without it they stay open as before, and the
+// boot log says so. The CRM does not use them — it reads MongoDB directly.
+// The Twilio webhooks, /voice, /health and the desk's /api/sourcing routes are
+// unaffected.
+// ---------------------------------------------------------------------------
+const ADMIN_API_KEY = (process.env.ADMIN_API_KEY || "").trim();
+function requireAdminKey(req, res, next) {
+  if (!ADMIN_API_KEY) return next();
+  const given = req.get("x-api-key") || "";
+  if (given.length !== ADMIN_API_KEY.length || !require("crypto").timingSafeEqual(Buffer.from(given), Buffer.from(ADMIN_API_KEY))) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+  next();
+}
+for (const path of ["/messages", "/send-whatsapp", "/stuck-leads", "/leads-to-message", "/sourcing-requests", "/senders", "/telegram/status", "/statuses"]) {
+  app.use(path, requireAdminKey);
+}
+
 app.get("/health", (req, res) => {
   res.status(200).json({
     status: "UP",
@@ -432,6 +455,13 @@ app.post("/message-status", async (req, res) => {
 
     if (status === "failed" || status === "undelivered") {
       const reason = `Delivery ${status}${errorCode ? ` (error ${errorCode})` : ""}`;
+
+      // A message a person sent from the CRM: mark it on the conversation so
+      // the CRM shows it did not arrive (usually the 24h window: call them).
+      if (await crmBridge.markDeliveryFailed(req.body.MessageSid, status, errorCode).catch(() => false)) {
+        console.error(`❌ CRM message to ${to} - ${reason}.`);
+        return;
+      }
 
       // Only treat this as a lead if it's actually in the queue. Otherwise it's
       // an outbound message to a team member / admin (e.g. a qualified-lead
@@ -654,6 +684,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
           stuckNotified: false,
           stuckNotifiedAt: null,
           stuckSnoozedUntil: null,
+          stuck: null, // the CRM's stuck flag: they replied, so not stuck
         },
         $setOnInsert: { step: "intro", status: "Lead", botActive: true },
       },
@@ -841,6 +872,13 @@ app.post("/webhook/whatsapp", async (req, res) => {
     // "handle these leads" destination so a human can jump in. Independent of the
     // handoff flow — this can fire at any step, and every distinct question notifies.
     if (!ai.error && allSent && ai.escalate) {
+      // Kept on the lead for the CRM's "Needs attention" page, whether or not
+      // the WhatsApp alert below gets through.
+      try {
+        await crmBridge.recordEscalation(phoneNumber, { note: ai.escalationNote, question: incomingText });
+      } catch (recErr) {
+        console.error("❌ Could not record the escalation:", recErr.message);
+      }
       try {
         await notifyEscalation(updatedConvo || convo, {
           sendWhatsApp,
@@ -1235,10 +1273,18 @@ app.listen(PORT, () => {
   console.log(`🏠 Home: http://localhost:${PORT}/`);
   console.log(`🏥 Health: http://localhost:${PORT}/health`);
   console.log(`📩 Webhook: http://localhost:${PORT}/webhook/whatsapp`);
+  if (!ADMIN_API_KEY) {
+    console.log("⚠️  ADMIN_API_KEY is not set: /messages, /send-whatsapp, /stuck-leads and the other admin routes are open to anyone who can reach this server.");
+  }
   console.log("=================================");
 
   // Feature 2: start the follow-up cron (nudges quiet leads at 30m / 2h / 1d).
   startFollowUpCron({ sendWhatsApp });
+
+  // The CRM: it reads leads from MongoDB and sends its actions (reply as a
+  // person, take over, hand back, snooze, stage, resolve) as commands, which
+  // run here with the same functions Telegram uses. No inbound route.
+  crmBridge.startCrmBridge({ sendWhatsApp, sendQueuedLead });
 
   // Feature 3: the daily Telegram list of leads that went quiet and never
   // qualified. Long polling, so no public URL is needed — just the bot token.
